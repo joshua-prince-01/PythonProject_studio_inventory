@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 from . import arduino, digikey, mcmaster
 
 # Order matters: more-specific detectors first if needed

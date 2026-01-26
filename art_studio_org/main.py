@@ -4,7 +4,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from vendors.registry import pick_parser
+from art_studio_org.vendors.registry import pick_parser
 
 
 # ----------------------------
@@ -343,7 +343,8 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
 
 def main():
     print("=== Receipt Ingest (CLI) ===")
-    print(f"Python sees cwd as: {Path.cwd().resolve()}")
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    print(f"Project root: {PROJECT_ROOT}")
 
     receipts_folder = pick_folder_from_cwd()
     pdf_paths = pick_pdfs_in_folder(receipts_folder)

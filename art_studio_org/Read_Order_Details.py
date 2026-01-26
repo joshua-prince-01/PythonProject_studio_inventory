@@ -203,7 +203,7 @@ def extract_order_info_by_page(pdf_path: str, debug: bool = False) -> OrderInfo:
 if __name__ == "__main__":
     import os
     pdf_path = os.path.expanduser(
-        "~/PycharmProjects/PythonProject_studio_inventory/McMaster_Items/receipts/Receipt 55152414.PDF"
+        "/not_in_use/McMaster_Items/receipts/Receipt 55152414.PDF"
     )
     info = extract_order_info_by_page(pdf_path, debug=True)
 
