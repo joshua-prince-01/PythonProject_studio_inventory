@@ -1,5 +1,6 @@
 # art_studio_org/main.py
 # Unified CLI ingest for multiple vendors via art_studio_org.vendors.registry.pick_parser
+# Includes per-run log file written to project_root/log/
 
 from __future__ import annotations
 
@@ -7,9 +8,56 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
 import re
+import traceback
 import pandas as pd
 
 from art_studio_org.vendors.registry import pick_parser
+
+
+# ----------------------------
+# Simple run logger
+# ----------------------------
+
+class RunLogger:
+    def __init__(self, log_path: Path, echo: bool = True):
+        self.log_path = log_path
+        self._fh = log_path.open("w", encoding="utf-8")
+        self.echo = echo
+
+    def close(self):
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+    def log(self, msg: str = ""):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {msg}"
+        self._fh.write(line + "\n")
+        self._fh.flush()
+        if self.echo:
+            print(msg)
+
+    def exception(self, context: str):
+        self.log(f"ERROR: {context}")
+        self.log(traceback.format_exc())
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def create_run_log(echo: bool = True) -> RunLogger:
+    root = project_root()
+    log_dir = root / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"run_{stamp}.txt"
+    logger = RunLogger(log_path=log_path, echo=echo)
+    logger.log(f"Log file: {log_path}")
+    logger.log(f"Project root: {root}")
+    logger.log(f"CWD: {Path.cwd().resolve()}")
+    return logger
 
 
 # ----------------------------
@@ -17,15 +65,6 @@ from art_studio_org.vendors.registry import pick_parser
 # ----------------------------
 
 def pick_folder_from_cwd(start_dir: str | Path | None = None) -> Path:
-    """
-    Interactive folder navigator starting at start_dir (default: cwd).
-    Commands:
-      - number : enter that folder
-      - .      : select current folder
-      - ..     : go up one folder
-      - /path, ~/path, relative/path : jump to a path
-      - q      : quit program
-    """
     cur = Path(start_dir) if start_dir else Path.cwd()
 
     while True:
@@ -42,7 +81,6 @@ def pick_folder_from_cwd(start_dir: str | Path | None = None) -> Path:
             cur = cur.parent
             continue
         except FileNotFoundError:
-            # If the directory was deleted/moved while browsing, fall back to parent.
             cur = cur.parent
             continue
 
@@ -64,7 +102,6 @@ def pick_folder_from_cwd(start_dir: str | Path | None = None) -> Path:
             cur = cur.parent if cur.parent != cur else cur
             continue
 
-        # Jump to a path
         if choice.startswith(("/", "~")) or "/" in choice or choice.startswith("."):
             candidate = Path(choice).expanduser()
             if not candidate.is_absolute():
@@ -77,7 +114,6 @@ def pick_folder_from_cwd(start_dir: str | Path | None = None) -> Path:
                 print(f"Not a folder: {candidate}")
             continue
 
-        # Number selection
         if choice.isdigit():
             idx = int(choice) - 1
             if 0 <= idx < len(subdirs):
@@ -129,25 +165,15 @@ def pick_pdfs_in_folder(folder: Path) -> list[Path]:
             out.append(pdfs[idx])
         return out
 
-    # substring match
     needle = choice
-    matches = [p for p in pdfs if needle in p.name.lower()]
-    return matches
+    return [p for p in pdfs if needle in p.name.lower()]
 
 
 # ----------------------------
-# Export folder picker (separate UX from ingest)
+# Export folder picker
 # ----------------------------
 
 def _export_browser(start_dir: Path) -> Path | None:
-    """
-    Export folder browser:
-      - Enter  : choose CURRENT folder
-      - number : enter that folder
-      - ..     : go up
-      - q      : cancel export selection (returns None)
-      - /path, ~/path, relative : jump
-    """
     cur = start_dir.expanduser()
 
     while True:
@@ -185,7 +211,6 @@ def _export_browser(start_dir: Path) -> Path | None:
             cur = cur.parent if cur.parent != cur else cur
             continue
 
-        # Jump to a path
         if choice.startswith(("/", "~")) or "/" in choice or choice.startswith("."):
             candidate = Path(choice).expanduser()
             if not candidate.is_absolute():
@@ -211,7 +236,6 @@ def _export_browser(start_dir: Path) -> Path | None:
 
 def pick_export_folder(default_dir: Path) -> Path | None:
     default_dir = default_dir.expanduser()
-    # If default doesn't exist, browse from its parent (so user still sees the right neighborhood)
     browse_start = default_dir if default_dir.exists() else default_dir.parent
 
     print("\n=== Export Folder Picker ===")
@@ -223,14 +247,11 @@ def pick_export_folder(default_dir: Path) -> Path | None:
 
     if choice == "":
         return default_dir.resolve()
-
     if choice.lower() == "q":
         return None
-
     if choice.lower() == "pick":
         return _export_browser(browse_start)
 
-    # Path typed
     candidate = Path(choice).expanduser()
     if not candidate.is_absolute():
         candidate = (Path.cwd() / candidate).resolve()
@@ -277,97 +298,104 @@ def infer_pack_qty(description: str) -> int:
 
 
 def _dictify(obj) -> dict:
-    """
-    Vendor parsers sometimes return dataclasses, sometimes dicts.
-    Normalize to a dict without assuming structure.
-    """
     if obj is None:
         return {}
     if isinstance(obj, dict):
         return obj
     if is_dataclass(obj):
         return asdict(obj)
-    # fallback: try attribute dict
     if hasattr(obj, "__dict__"):
         return dict(obj.__dict__)
     return {}
 
 
-def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
-    """
-    Ingest receipts from multiple vendors by selecting a parser per PDF.
-    Each vendor module should expose:
-      - parse_order(pdf_path: str, debug: bool=False) -> dict|dataclass
-      - parse_line_items(pdf_path: str, debug: bool=False) -> list[dict]
-    """
+def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogger | None = None):
     order_rows: list[dict] = []
     item_rows: list[dict] = []
 
-    for pdf_path in pdf_paths:
-        if debug:
-            print(f"\n=== Processing: {pdf_path.name} ===")
+    def log(msg: str):
+        if logger:
+            logger.log(msg)
+        else:
+            print(msg)
 
+    for pdf_path in pdf_paths:
         parser = pick_parser(str(pdf_path))
-        if not parser:
-            if debug:
-                print(f"[SKIP] No parser matched: {pdf_path.name}")
+        parser_name = getattr(parser, "__name__", None) if parser else "(none)"
+
+        log(f"FILE: {pdf_path.name}")
+        log(f"  PATH: {pdf_path}")
+        log(f"  PARSER: {parser_name}")
+
+        if parser is None:
+            log("  RESULT: SKIPPED (no parser matched)\n")
             continue
 
         if debug:
-            print(f"Using parser: {parser.__name__ if hasattr(parser, '__name__') else parser}")
+            print(f"\n=== Processing: {pdf_path.name} ===")
+            print(f"Using parser: {parser_name}")
 
-        info = _dictify(parser.parse_order(str(pdf_path), debug=debug))
+        try:
+            info = _dictify(parser.parse_order(str(pdf_path), debug=debug))
+            vendor = (info.get("vendor") or getattr(parser, "VENDOR", None) or "unknown").lower()
 
-        vendor = (info.get("vendor") or getattr(parser, "VENDOR", None) or "unknown").lower()
-
-        order_rows.append({
-            "vendor": vendor,
-            "source_file": pdf_path.name,
-            "pdf_path": str(pdf_path),
-            "purchase_order": info.get("purchase_order"),
-            "invoice": info.get("invoice"),
-            "invoice_date": info.get("invoice_date"),
-            "account_number": info.get("account_number"),
-            "payment_date": info.get("payment_date"),
-            "credit_card": info.get("credit_card"),
-            "merchandise": info.get("merchandise"),
-            "shipping": info.get("shipping"),
-            "sales_tax": info.get("sales_tax"),
-            "total": info.get("total"),
-        })
-
-        items = parser.parse_line_items(str(pdf_path), debug=debug) or []
-        for d in items:
-            # Keep only expected keys; vendor parsers may add extra (mfg, coo, etc)
-            row = {
+            order_rows.append({
                 "vendor": vendor,
                 "source_file": pdf_path.name,
-                "invoice": info.get("invoice"),
+                "pdf_path": str(pdf_path),
                 "purchase_order": info.get("purchase_order"),
-                "line": d.get("line"),
-                "sku": d.get("sku"),
-                "description": d.get("description"),
-                "ordered": d.get("ordered"),
-                "shipped": d.get("shipped"),
-                "balance": d.get("balance"),
-                "unit_price": d.get("unit_price"),
-                "line_total": d.get("line_total"),
-            }
-            # carry-through optional vendor fields if present (no harm)
-            for k in ("part", "mfg", "mfg_pn", "coo"):
-                if k in d and k not in row:
-                    row[k] = d.get(k)
-            item_rows.append(row)
+                "invoice": info.get("invoice"),
+                "invoice_date": info.get("invoice_date"),
+                "account_number": info.get("account_number"),
+                "payment_date": info.get("payment_date"),
+                "credit_card": info.get("credit_card"),
+                "merchandise": info.get("merchandise"),
+                "shipping": info.get("shipping"),
+                "sales_tax": info.get("sales_tax"),
+                "total": info.get("total"),
+            })
+
+            items = parser.parse_line_items(str(pdf_path), debug=debug) or []
+            log(f"  ORDER: vendor={vendor} invoice={info.get('invoice')} po={info.get('purchase_order')} date={info.get('invoice_date')}")
+            log(f"  LINE_ITEMS: {len(items)} parsed")
+
+            for d in items:
+                row = {
+                    "vendor": vendor,
+                    "source_file": pdf_path.name,
+                    "invoice": info.get("invoice"),
+                    "purchase_order": info.get("purchase_order"),
+                    "line": d.get("line"),
+                    "sku": d.get("sku"),
+                    "description": d.get("description"),
+                    "ordered": d.get("ordered"),
+                    "shipped": d.get("shipped"),
+                    "balance": d.get("balance"),
+                    "unit_price": d.get("unit_price"),
+                    "line_total": d.get("line_total"),
+                }
+                for k in ("part", "mfg", "mfg_pn", "coo"):
+                    if k in d and k not in row:
+                        row[k] = d.get(k)
+                item_rows.append(row)
+
+            log("  RESULT: OK\n")
+
+        except Exception:
+            if logger:
+                logger.exception(f"Failed parsing {pdf_path.name} with parser={parser_name}")
+            else:
+                print(f"[ERROR] Failed parsing {pdf_path.name} with parser={parser_name}")
+                traceback.print_exc()
+            log("")
 
     orders_df = pd.DataFrame(order_rows)
     line_items_df = pd.DataFrame(item_rows)
 
-    # Normalize order totals
     for col in ("merchandise", "shipping", "sales_tax", "total"):
         if col in orders_df.columns:
             orders_df[col] = orders_df[col].apply(to_float)
 
-    # If there are no line items, return a correctly-shaped empty inventory DF
     if line_items_df.empty:
         inventory_df = pd.DataFrame(columns=[
             "part_key", "vendor", "sku", "description",
@@ -375,7 +403,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
         ])
         return orders_df, line_items_df, inventory_df
 
-    # Normalize line fields (guard each column)
     for col in ("line", "ordered", "shipped", "balance"):
         if col in line_items_df.columns:
             line_items_df[col] = line_items_df[col].apply(to_int)
@@ -387,14 +414,12 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
     if "description" not in line_items_df.columns:
         line_items_df["description"] = ""
 
-    # pack_qty + units_received
     line_items_df["pack_qty"] = line_items_df["description"].fillna("").apply(infer_pack_qty)
 
     shipped = pd.to_numeric(line_items_df.get("shipped"), errors="coerce").fillna(0).astype(int)
     pack_qty = pd.to_numeric(line_items_df.get("pack_qty"), errors="coerce").fillna(1).astype(int)
     line_items_df["units_received"] = shipped * pack_qty
 
-    # If line_total missing, compute from ordered * unit_price where possible
     if "line_total" not in line_items_df.columns:
         line_items_df["line_total"] = pd.NA
 
@@ -404,12 +429,10 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
     )
     line_items_df["line_total"] = line_items_df["line_total"].fillna(computed_total)
 
-    # part_key
     if "sku" not in line_items_df.columns:
         line_items_df["sku"] = ""
     line_items_df["part_key"] = line_items_df["vendor"].astype(str) + ":" + line_items_df["sku"].astype(str)
 
-    # Inventory rollup
     inventory_df = (
         line_items_df.groupby("part_key", as_index=False)
         .agg(
@@ -432,57 +455,70 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
 
 def main():
     print("=== Receipt Ingest (CLI) ===")
-    print(f"Python sees cwd as: {Path.cwd().resolve()}")
 
-    receipts_folder = pick_folder_from_cwd()
-    pdf_paths = pick_pdfs_in_folder(receipts_folder)
+    debug = (input("Debug prints? [y/N]: ").strip().lower() == "y")
+    logger = create_run_log(echo=True)
+    logger.log(f"Debug: {debug}")
 
-    if not pdf_paths:
-        print("Nothing selected. Exiting.")
-        return
+    try:
+        receipts_folder = pick_folder_from_cwd()
+        logger.log(f"Selected receipts folder: {receipts_folder}")
 
-    debug = (input("\nDebug prints? [y/N]: ").strip().lower() == "y")
+        pdf_paths = pick_pdfs_in_folder(receipts_folder)
+        logger.log(f"Selected PDFs ({len(pdf_paths)}): " + ", ".join(p.name for p in pdf_paths))
 
-    # IMPORTANT: Use the multi-vendor ingest (NOT the old mcmaster-only path)
-    orders_df, line_items_df, inventory_df = ingest_receipts(pdf_paths, debug=debug)
+        if not pdf_paths:
+            logger.log("Nothing selected. Exiting.")
+            return
 
-    print("\n--- ORDERS (head) ---")
-    print(orders_df.head(10).to_string(index=False))
+        orders_df, line_items_df, inventory_df = ingest_receipts(pdf_paths, debug=debug, logger=logger)
 
-    print("\n--- LINE ITEMS (head) ---")
-    print(line_items_df.head(15).to_string(index=False))
+        print("\n--- ORDERS (head) ---")
+        print(orders_df.head(10).to_string(index=False))
 
-    print("\n--- INVENTORY (top spend) ---")
-    if inventory_df.empty:
-        print("(empty)")
-    else:
-        print(inventory_df.sort_values("total_spend", ascending=False).head(20).to_string(index=False))
+        print("\n--- LINE ITEMS (head) ---")
+        print(line_items_df.head(15).to_string(index=False))
 
-    # ----------------------------
-    # EXPORT CSVs
-    # ----------------------------
-    default_export_dir = (receipts_folder.parent / "exports").resolve()
-    export_dir = pick_export_folder(default_export_dir)
+        print("\n--- INVENTORY (top spend) ---")
+        if inventory_df.empty:
+            print("(empty)")
+        else:
+            print(inventory_df.sort_values("total_spend", ascending=False).head(20).to_string(index=False))
+        # this was commented out becuase it would place the default folder inside where we grabbed reciepts, not
+        # the default 'exports' folder of the project:
+        #default_export_dir = (receipts_folder.parent / "exports").resolve()
+        default_export_dir = (project_root() / "exports").resolve()
 
-    if export_dir is None:
-        print("\nExport cancelled.")
-        return
+        logger.log(f"Default export dir: {default_export_dir}")
 
-    export_dir.mkdir(parents=True, exist_ok=True)
+        export_dir = pick_export_folder(default_export_dir)
+        if export_dir is None:
+            logger.log("Export cancelled.")
+            return
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    orders_csv = export_dir / f"orders_{stamp}.csv"
-    items_csv = export_dir / f"line_items_{stamp}.csv"
-    inv_csv = export_dir / f"inventory_{stamp}.csv"
+        export_dir.mkdir(parents=True, exist_ok=True)
 
-    orders_df.to_csv(orders_csv, index=False)
-    line_items_df.to_csv(items_csv, index=False)
-    inventory_df.to_csv(inv_csv, index=False)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        orders_csv = export_dir / f"orders_{stamp}.csv"
+        items_csv = export_dir / f"line_items_{stamp}.csv"
+        inv_csv = export_dir / f"inventory_{stamp}.csv"
 
-    print("\n✅ CSV files saved:")
-    print(" ", orders_csv)
-    print(" ", items_csv)
-    print(" ", inv_csv)
+        orders_df.to_csv(orders_csv, index=False)
+        line_items_df.to_csv(items_csv, index=False)
+        inventory_df.to_csv(inv_csv, index=False)
+
+        logger.log("CSV files saved:")
+        logger.log(f"  {orders_csv}")
+        logger.log(f"  {items_csv}")
+        logger.log(f"  {inv_csv}")
+
+        print("\n✅ CSV files saved:")
+        print(" ", orders_csv)
+        print(" ", items_csv)
+        print(" ", inv_csv)
+
+    finally:
+        logger.close()
 
 
 if __name__ == "__main__":
