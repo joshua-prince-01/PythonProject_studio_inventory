@@ -1,7 +1,12 @@
-import re
-from pathlib import Path
-from datetime import datetime
+# art_studio_org/main.py
+# Unified CLI ingest for multiple vendors via art_studio_org.vendors.registry.pick_parser
 
+from __future__ import annotations
+
+from dataclasses import asdict, is_dataclass
+from datetime import datetime
+from pathlib import Path
+import re
 import pandas as pd
 
 from art_studio_org.vendors.registry import pick_parser
@@ -11,16 +16,15 @@ from art_studio_org.vendors.registry import pick_parser
 # Folder + PDF pickers
 # ----------------------------
 
-def pick_folder_from_cwd(start_dir=None) -> Path:
+def pick_folder_from_cwd(start_dir: str | Path | None = None) -> Path:
     """
     Interactive folder navigator starting at start_dir (default: cwd).
-
     Commands:
       - number : enter that folder
       - .      : select current folder
       - ..     : go up one folder
       - /path, ~/path, relative/path : jump to a path
-      - q      : quit
+      - q      : quit program
     """
     cur = Path(start_dir) if start_dir else Path.cwd()
 
@@ -35,6 +39,10 @@ def pick_folder_from_cwd(start_dir=None) -> Path:
             subdirs = sorted([p for p in cur.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
         except PermissionError:
             print("Permission denied. Going up one level.")
+            cur = cur.parent
+            continue
+        except FileNotFoundError:
+            # If the directory was deleted/moved while browsing, fall back to parent.
             cur = cur.parent
             continue
 
@@ -78,13 +86,8 @@ def pick_folder_from_cwd(start_dir=None) -> Path:
                 print("Invalid number.")
             continue
 
-        # Allow typing a subfolder name directly
-        candidate = (cur / choice).expanduser().resolve()
-        if candidate.exists() and candidate.is_dir():
-            cur = candidate
-            continue
-
         print("Unrecognized input.")
+
 
 def pick_pdfs_in_folder(folder: Path) -> list[Path]:
     pdfs = sorted(list(folder.glob("*.pdf")) + list(folder.glob("*.PDF")))
@@ -131,106 +134,192 @@ def pick_pdfs_in_folder(folder: Path) -> list[Path]:
     matches = [p for p in pdfs if needle in p.name.lower()]
     return matches
 
-def pick_export_folder(default_dir: Path) -> Path:
-    """
-    Export folder picker.
 
-    - Enter        → use default (even if it doesn't exist yet)
-    - pick         → browse folders interactively
-    - path         → jump to a folder
-    - folder is only created AFTER selection
+# ----------------------------
+# Export folder picker (separate UX from ingest)
+# ----------------------------
+
+def _export_browser(start_dir: Path) -> Path | None:
     """
-    default_dir = default_dir.expanduser().resolve()
+    Export folder browser:
+      - Enter  : choose CURRENT folder
+      - number : enter that folder
+      - ..     : go up
+      - q      : cancel export selection (returns None)
+      - /path, ~/path, relative : jump
+    """
+    cur = start_dir.expanduser()
+
+    while True:
+        cur = cur.expanduser().resolve()
+        print("\n=== Export Folder Browser ===")
+        print(f"Current folder: {cur}")
+        print("Enter = choose this folder | number = enter folder | .. = up | q = cancel")
+        print("Or type a path to jump (~/... or /... or relative).\n")
+
+        try:
+            subdirs = sorted([p for p in cur.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
+        except PermissionError:
+            print("Permission denied. Going up one level.")
+            cur = cur.parent
+            continue
+        except FileNotFoundError:
+            cur = cur.parent
+            continue
+
+        if not subdirs:
+            print("  (No subfolders here)")
+        else:
+            for i, d in enumerate(subdirs, start=1):
+                print(f"  [{i}] {d.name}")
+
+        choice = input("\n> ").strip()
+
+        if choice == "":
+            return cur
+
+        if choice.lower() == "q":
+            return None
+
+        if choice == "..":
+            cur = cur.parent if cur.parent != cur else cur
+            continue
+
+        # Jump to a path
+        if choice.startswith(("/", "~")) or "/" in choice or choice.startswith("."):
+            candidate = Path(choice).expanduser()
+            if not candidate.is_absolute():
+                candidate = cur / candidate
+            candidate = candidate.resolve()
+
+            if candidate.exists() and candidate.is_dir():
+                cur = candidate
+            else:
+                print(f"Not a folder: {candidate}")
+            continue
+
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(subdirs):
+                cur = subdirs[idx]
+            else:
+                print("Invalid number.")
+            continue
+
+        print("Unrecognized input.")
+
+
+def pick_export_folder(default_dir: Path) -> Path | None:
+    default_dir = default_dir.expanduser()
+    # If default doesn't exist, browse from its parent (so user still sees the right neighborhood)
+    browse_start = default_dir if default_dir.exists() else default_dir.parent
 
     print("\n=== Export Folder Picker ===")
-    print(f"Default export folder:\n  {default_dir}")
-    print("\nPress Enter to use default, 'q' --> quit, type 'pick' to browse, or type a path to jump.")
+    print("Default export folder:")
+    print(f"  {default_dir.resolve()}")
+    print("\nPress Enter to use default, 'q' to cancel export, 'pick' to browse, or type a path to jump.")
 
     choice = input("> ").strip()
 
-    # ----------------------------------------
-    # Use default (do NOT create yet)
-    # ----------------------------------------
     if choice == "":
-        return default_dir
+        return default_dir.resolve()
 
-    # ----------------------------------------
-    # Quit if desired
-    # ----------------------------------------
-    if choice == "q":
-        raise SystemExit(0)
+    if choice.lower() == "q":
+        return None
 
-    # ----------------------------------------
-    # Browse interactively
-    # ----------------------------------------
     if choice.lower() == "pick":
-        start_dir = default_dir if default_dir.exists() else default_dir.parent
-        return pick_folder_from_cwd(start_dir=start_dir)
+        return _export_browser(browse_start)
 
-    # ----------------------------------------
-    # Jump to a typed path
-    # ----------------------------------------
+    # Path typed
     candidate = Path(choice).expanduser()
     if not candidate.is_absolute():
         candidate = (Path.cwd() / candidate).resolve()
-
     return candidate
 
+
 # ----------------------------
-# Ingest helpers
+# Ingest helpers + normalization
 # ----------------------------
 
 PACK_RE = re.compile(r"\bPacks?\s+of\s+(\d+)\b", re.I)
 
+
 def to_int(x):
     try:
-        return int(str(x).strip())
+        s = str(x).strip()
+        if s == "" or s.lower() == "none":
+            return pd.NA
+        return int(float(s))
     except Exception:
         return pd.NA
 
+
 def to_float(x):
     try:
-        return float(str(x).replace("$", "").replace(",", "").strip())
+        s = str(x).replace("$", "").replace(",", "").strip()
+        if s == "" or s.lower() == "none":
+            return pd.NA
+        return float(s)
     except Exception:
         return pd.NA
+
 
 def infer_pack_qty(description: str) -> int:
     if not description:
         return 1
     m = PACK_RE.search(description)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return 1
-    return 1
+    if not m:
+        return 1
+    try:
+        return int(m.group(1))
+    except Exception:
+        return 1
+
+
+def _dictify(obj) -> dict:
+    """
+    Vendor parsers sometimes return dataclasses, sometimes dicts.
+    Normalize to a dict without assuming structure.
+    """
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    if is_dataclass(obj):
+        return asdict(obj)
+    # fallback: try attribute dict
+    if hasattr(obj, "__dict__"):
+        return dict(obj.__dict__)
+    return {}
+
 
 def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
     """
-    Vendor-agnostic ingest:
-      - detect vendor parser per PDF
-      - parse order + line items
-      - normalize dtypes
-      - compute inventory rollups
+    Ingest receipts from multiple vendors by selecting a parser per PDF.
+    Each vendor module should expose:
+      - parse_order(pdf_path: str, debug: bool=False) -> dict|dataclass
+      - parse_line_items(pdf_path: str, debug: bool=False) -> list[dict]
     """
     order_rows: list[dict] = []
     item_rows: list[dict] = []
 
     for pdf_path in pdf_paths:
+        if debug:
+            print(f"\n=== Processing: {pdf_path.name} ===")
+
         parser = pick_parser(str(pdf_path))
-        if parser is None:
+        if not parser:
             if debug:
-                print(f"[WARN] No vendor detected: {pdf_path.name}")
+                print(f"[SKIP] No parser matched: {pdf_path.name}")
             continue
 
         if debug:
-            print(f"\n=== Processing: {pdf_path.name} ===")
-            print(f"Using parser: {getattr(parser, '__name__', str(parser))}")
+            print(f"Using parser: {parser.__name__ if hasattr(parser, '__name__') else parser}")
 
-        info = parser.parse_order(str(pdf_path), debug=debug) or {}
-        vendor = info.get("vendor") or "unknown"
+        info = _dictify(parser.parse_order(str(pdf_path), debug=debug))
 
-        # Order row
+        vendor = (info.get("vendor") or getattr(parser, "VENDOR", None) or "unknown").lower()
+
         order_rows.append({
             "vendor": vendor,
             "source_file": pdf_path.name,
@@ -249,50 +338,36 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
 
         items = parser.parse_line_items(str(pdf_path), debug=debug) or []
         for d in items:
-            # accept both old and new keys (some vendor parsers may still emit price/total)
-            unit_price = d.get("unit_price", d.get("price"))
-            line_total = d.get("line_total", d.get("total"))
-
-            item_rows.append({
+            # Keep only expected keys; vendor parsers may add extra (mfg, coo, etc)
+            row = {
                 "vendor": vendor,
                 "source_file": pdf_path.name,
                 "invoice": info.get("invoice"),
                 "purchase_order": info.get("purchase_order"),
                 "line": d.get("line"),
                 "sku": d.get("sku"),
-                "part": d.get("part"),
-                "mfg": d.get("mfg"),
-                "mfg_pn": d.get("mfg_pn"),
-                "coo": d.get("coo"),
                 "description": d.get("description"),
                 "ordered": d.get("ordered"),
                 "shipped": d.get("shipped"),
                 "balance": d.get("balance"),
-                "unit_price": unit_price,
-                "line_total": line_total,
-            })
+                "unit_price": d.get("unit_price"),
+                "line_total": d.get("line_total"),
+            }
+            # carry-through optional vendor fields if present (no harm)
+            for k in ("part", "mfg", "mfg_pn", "coo"):
+                if k in d and k not in row:
+                    row[k] = d.get(k)
+            item_rows.append(row)
 
     orders_df = pd.DataFrame(order_rows)
     line_items_df = pd.DataFrame(item_rows)
 
-    # ----------------------------
-    # Normalize types
-    # ----------------------------
-    for col in ["merchandise", "shipping", "sales_tax", "total"]:
+    # Normalize order totals
+    for col in ("merchandise", "shipping", "sales_tax", "total"):
         if col in orders_df.columns:
             orders_df[col] = orders_df[col].apply(to_float)
 
-    for col in ["line", "ordered", "shipped", "balance"]:
-        if col in line_items_df.columns:
-            line_items_df[col] = line_items_df[col].apply(to_int)
-
-    for col in ["unit_price", "line_total"]:
-        if col in line_items_df.columns:
-            line_items_df[col] = line_items_df[col].apply(to_float)
-
-    # ----------------------------
-    # Inventory rollup (safe if empty)
-    # ----------------------------
+    # If there are no line items, return a correctly-shaped empty inventory DF
     if line_items_df.empty:
         inventory_df = pd.DataFrame(columns=[
             "part_key", "vendor", "sku", "description",
@@ -300,15 +375,26 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
         ])
         return orders_df, line_items_df, inventory_df
 
+    # Normalize line fields (guard each column)
+    for col in ("line", "ordered", "shipped", "balance"):
+        if col in line_items_df.columns:
+            line_items_df[col] = line_items_df[col].apply(to_int)
+
+    for col in ("unit_price", "line_total"):
+        if col in line_items_df.columns:
+            line_items_df[col] = line_items_df[col].apply(to_float)
+
     if "description" not in line_items_df.columns:
         line_items_df["description"] = ""
 
+    # pack_qty + units_received
     line_items_df["pack_qty"] = line_items_df["description"].fillna("").apply(infer_pack_qty)
-    line_items_df["units_received"] = (
-        pd.to_numeric(line_items_df.get("shipped"), errors="coerce").fillna(0).astype(int)
-        * pd.to_numeric(line_items_df.get("pack_qty"), errors="coerce").fillna(1).astype(int)
-    )
 
+    shipped = pd.to_numeric(line_items_df.get("shipped"), errors="coerce").fillna(0).astype(int)
+    pack_qty = pd.to_numeric(line_items_df.get("pack_qty"), errors="coerce").fillna(1).astype(int)
+    line_items_df["units_received"] = shipped * pack_qty
+
+    # If line_total missing, compute from ordered * unit_price where possible
     if "line_total" not in line_items_df.columns:
         line_items_df["line_total"] = pd.NA
 
@@ -318,10 +404,12 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
     )
     line_items_df["line_total"] = line_items_df["line_total"].fillna(computed_total)
 
-    line_items_df["part_key"] = (
-        line_items_df["vendor"].astype(str) + ":" + line_items_df["sku"].astype(str)
-    )
+    # part_key
+    if "sku" not in line_items_df.columns:
+        line_items_df["sku"] = ""
+    line_items_df["part_key"] = line_items_df["vendor"].astype(str) + ":" + line_items_df["sku"].astype(str)
 
+    # Inventory rollup
     inventory_df = (
         line_items_df.groupby("part_key", as_index=False)
         .agg(
@@ -337,14 +425,14 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
 
     return orders_df, line_items_df, inventory_df
 
+
 # ----------------------------
 # MAIN
 # ----------------------------
 
 def main():
     print("=== Receipt Ingest (CLI) ===")
-    PROJECT_ROOT = Path(__file__).resolve().parents[1]
-    print(f"Project root: {PROJECT_ROOT}")
+    print(f"Python sees cwd as: {Path.cwd().resolve()}")
 
     receipts_folder = pick_folder_from_cwd()
     pdf_paths = pick_pdfs_in_folder(receipts_folder)
@@ -355,6 +443,7 @@ def main():
 
     debug = (input("\nDebug prints? [y/N]: ").strip().lower() == "y")
 
+    # IMPORTANT: Use the multi-vendor ingest (NOT the old mcmaster-only path)
     orders_df, line_items_df, inventory_df = ingest_receipts(pdf_paths, debug=debug)
 
     print("\n--- ORDERS (head) ---")
@@ -369,10 +458,16 @@ def main():
     else:
         print(inventory_df.sort_values("total_spend", ascending=False).head(20).to_string(index=False))
 
+    # ----------------------------
     # EXPORT CSVs
+    # ----------------------------
     default_export_dir = (receipts_folder.parent / "exports").resolve()
-
     export_dir = pick_export_folder(default_export_dir)
+
+    if export_dir is None:
+        print("\nExport cancelled.")
+        return
+
     export_dir.mkdir(parents=True, exist_ok=True)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -388,6 +483,7 @@ def main():
     print(" ", orders_csv)
     print(" ", items_csv)
     print(" ", inv_csv)
+
 
 if __name__ == "__main__":
     main()
