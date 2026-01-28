@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-
+from pathlib import Path
 from dotenv import load_dotenv
 from requests_pkcs12 import post, put, get
 
@@ -25,7 +25,9 @@ class McMasterCreds:
 
     @classmethod
     def from_env(cls) -> "McMasterCreds":
-        load_dotenv("secrets/mcmaster.env")
+        #load_dotenv("secrets/mcmaster.env") # relative path
+        env_path = Path(__file__).resolve().parents[2] / "secrets" / "mcmaster.env" # absolute path
+        load_dotenv(env_path)
         return cls(
             username=os.environ["MCMASTER_USERNAME"],
             password=os.environ["MCMASTER_PASSWORD"],
