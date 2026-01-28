@@ -893,7 +893,17 @@ def labels_make_pdf(db: DB):
     console.print("[bold]Make labels PDF[/bold]\n")
 
     # template
-    tpl = Prompt.ask("Template file", default="label_templates/avery_94102.json")
+    default_tpl = "label_templates/avery_94102.json"
+    tpl = Prompt.ask("Template file", default=default_tpl).strip()
+
+    # Treat '.' or empty as "use default"
+    if tpl in ("", "."):
+        tpl = default_tpl
+
+    # If user types just the filename, assume label_templates/
+    if "/" not in tpl:
+        tpl = f"label_templates/{tpl}"
+
     tpl_path = (project_root() / tpl).resolve()
     if not tpl_path.exists():
         console.print(f"[red]Template not found:[/red] {tpl_path}")
@@ -902,6 +912,7 @@ def labels_make_pdf(db: DB):
 
     # choose items
     mode = Prompt.ask("Pick items by", choices=["vendor", "search", "part_keys"], default="vendor")
+
     rows = []
 
     if mode == "vendor":
@@ -912,24 +923,33 @@ def labels_make_pdf(db: DB):
                               sku,
                               label_line1,
                               label_line2,
+                              label_short,
+                              purchase_url,
+                              label_qr_text
                        FROM parts_received
-                       ORDER BY vendor, sku LIMIT 200
-                       """)
+                       WHERE vendor = ?
+                       ORDER BY sku
+                       """, [vendor])
+
 
 
     elif mode == "search":
         term = Prompt.ask("Search term", default="").strip()
         like = f"%{term}%"
         rows = db.rows("""
-            SELECT part_key, vendor, sku, label_line1, label_line2, label_short, purchase_url, label_qr_text
-            FROM parts_received
-            WHERE part_key LIKE ? COLLATE NOCASE
-               OR sku LIKE ? COLLATE NOCASE
-               OR description LIKE ? COLLATE NOCASE
-               OR label_short LIKE ? COLLATE NOCASE
-            ORDER BY vendor, sku
-            LIMIT 200
-        """, [like, like, like, like])
+                       SELECT part_key,
+                              vendor,
+                              sku,
+                              label_line1,
+                              label_line2,
+                              label_short,
+                              purchase_url,
+                              label_qr_text
+                       FROM parts_received
+                       WHERE vendor = ?
+                       ORDER BY sku
+                       """, [vendor])
+
 
     else:
         keys = Prompt.ask("Paste part_keys (comma-separated)", default="").strip()
@@ -937,12 +957,19 @@ def labels_make_pdf(db: DB):
         if not part_keys:
             return
         qmarks = ",".join(["?"] * len(part_keys))
-        rows = db.rows(f"""
-            SELECT part_key, vendor, sku, label_line1, label_line2, label_short, purchase_url, label_qr_text
-            FROM parts_received
-            WHERE part_key IN ({qmarks})
-            ORDER BY vendor, sku
-        """, part_keys)
+        rows = db.rows("""
+    SELECT part_key,
+                              vendor,
+                              sku,
+                              label_line1,
+                              label_line2,
+                              label_short,
+                              purchase_url,
+                              label_qr_text
+                       FROM parts_received
+                       WHERE vendor = ?
+                       ORDER BY sku
+                       """, [vendor])
 
     if not rows:
         console.print("[yellow]No items found.[/yellow]")
