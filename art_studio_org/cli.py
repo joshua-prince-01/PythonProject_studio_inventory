@@ -893,7 +893,7 @@ def labels_make_pdf(db: DB):
     console.print("[bold]Make labels PDF[/bold]\n")
 
     # template
-    tpl = Prompt.ask("Template file", default="label_templates/avery_5160.json")
+    tpl = Prompt.ask("Template file", default="label_templates/avery_94102.json")
     tpl_path = (project_root() / tpl).resolve()
     if not tpl_path.exists():
         console.print(f"[red]Template not found:[/red] {tpl_path}")
