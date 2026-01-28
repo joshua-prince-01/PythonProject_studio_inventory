@@ -32,30 +32,30 @@ def utc_now_iso() -> str:
 def header():
     console.print(Panel.fit("[bold]Studio Inventory[/bold]\nMenu-first CLI", border_style="cyan"))
 
-
 def pause():
     console.print()
     input("Press Enter to continue...")
 
-
 def get_db(db_path: Optional[Path] = None) -> DB:
     return DB(path=db_path or default_db_path())
-
 
 def safe_str(v) -> str:
     return "" if v is None else str(v)
 
+def fmt_money(v) -> str:
+    try:
+        return f"{float(v):,.2f}"
+    except (TypeError, ValueError):
+        return ""
 
 def shorten(s: str, n: int = 54) -> str:
     s = safe_str(s)
     return s if len(s) <= n else s[: n - 1] + "…"
 
-
 def exports_dir() -> Path:
     d = project_root() / "exports"
     d.mkdir(parents=True, exist_ok=True)
     return d
-
 
 def timestamp_slug() -> str:
     # local time is fine for filenames
@@ -422,6 +422,7 @@ def inv_browse(
         rows = fetch_page(page, page_size)
 
         t = Table(show_header=True, header_style="bold magenta")
+        t.add_column("#", justify="right", style="dim", width=4)
         t.add_column("part_key", style="dim")
         t.add_column("vendor", width=10)
         t.add_column("sku", width=14)
@@ -429,14 +430,16 @@ def inv_browse(
         t.add_column("on_hand", justify="right", width=8)
         t.add_column("avg_cost", justify="right", width=10)
 
-        for r in rows:
+        for i, r in enumerate(rows):
+            row_num = (page - 1) * page_size + i + 1
             t.add_row(
+                str(row_num),
                 safe_str(r["part_key"]),
                 safe_str(r["vendor"]),
                 safe_str(r["sku"]),
                 shorten(r["label_short"], 60),
                 safe_str(r["on_hand"]),
-                safe_str(r["avg_unit_cost"]),
+                fmt_money(r["avg_unit_cost"]),
             )
 
         console.print(t)
@@ -464,6 +467,20 @@ def inv_browse(
             if page_size not in page_sizes:
                 page_size = min(page_sizes, key=lambda x: abs(x - page_size))
             page = 1
+        elif cmd.isdigit():
+            idx = int(cmd) - 1
+            absolute_index = idx
+            target_page = absolute_index // page_size + 1
+            target_offset = absolute_index % page_size
+
+            # load that page
+            page = target_page
+            rows = fetch_page(page, page_size)
+
+            if 0 <= target_offset < len(rows):
+                part_key = rows[target_offset]["part_key"]
+                inv_show(db, part_key=part_key)
+            continue
         else:
             # allow numbers to mean "goto page"
             if cmd.isdigit():
@@ -495,10 +512,13 @@ def inv_search(db: DB):
     )
 
 
-def inv_show(db: DB):
+def inv_show(db: DB, part_key: str | None = None):
     console.clear()
     header()
     console.print("[bold]Show inventory item[/bold]\n")
+
+    if part_key is None:
+        part_key = Prompt.ask("part_key").strip()
 
     part_key = Prompt.ask("part_key (e.g. mcmaster:1234K56)").strip()
     if not part_key:
@@ -537,7 +557,8 @@ def inv_show(db: DB):
             rt.add_row(safe_str(rr["ts_utc"]), safe_str(rr["qty_removed"]), shorten(rr["project"], 18), shorten(rr["note"], 60))
         console.print(rt)
 
-    pause()
+    Prompt.ask("\nPress Enter to go back", default="")
+    return
 
 
 def inv_remove(db: DB):
