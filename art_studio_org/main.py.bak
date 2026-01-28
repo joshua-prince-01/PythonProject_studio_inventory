@@ -638,7 +638,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
 
     if line_items_df.empty:
         parts_received_df = pd.DataFrame(columns=[
-            "part_key", "vendor", "sku", "description",
+            "part_key", "vendor", "sku", "description", "desc_clean", "label_line1", "label_line2",
             "units_received", "total_spend", "last_invoice", "avg_unit_cost"
         ])
         parts_removed_df = pd.DataFrame(columns=["removal_uid","part_key","qty_removed","ts_utc","project","note"])
@@ -673,6 +673,20 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
     if "description" not in line_items_df.columns:
         line_items_df["description"] = ""
 
+    # Label fields (for drawer/bin labels) derived from description text
+    def _row_label(r):
+        desc_clean, l1, l2 = make_label_fields(
+            vendor=str(r.get("vendor", "") or ""),
+            sku=str(r.get("sku", "") or ""),
+            description=str(r.get("description", "") or ""),
+            mfg_pn=(r.get("mfg_pn") if "mfg_pn" in r else None),
+        )
+        return desc_clean, l1, l2
+
+    labels = line_items_df.apply(_row_label, axis=1, result_type="expand")
+    labels.columns = ["desc_clean", "label_line1", "label_line2"]
+    line_items_df = line_items_df.join(labels)
+
     line_items_df["pack_qty"] = line_items_df["description"].fillna("").apply(infer_pack_qty)
 
     shipped = pd.to_numeric(line_items_df.get("shipped"), errors="coerce").fillna(0).astype(int)
@@ -698,6 +712,9 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
             vendor=("vendor", "first"),
             sku=("sku", "first"),
             description=("description", "first"),
+            desc_clean=("desc_clean", "first"),
+            label_line1=("label_line1", "first"),
+            label_line2=("label_line2", "first"),
             units_received=("units_received", "sum"),
             total_spend=("line_total", "sum"),
             last_invoice=("invoice", "max"),
@@ -837,6 +854,9 @@ def init_inventory_db(dbfile: Path):
                 sku TEXT,
                 part_key TEXT,
                 description TEXT,
+                desc_clean TEXT,
+                label_line1 TEXT,
+                label_line2 TEXT,
                 line INTEGER,
                 ordered INTEGER,
                 shipped INTEGER,
@@ -856,6 +876,9 @@ def init_inventory_db(dbfile: Path):
                 vendor TEXT,
                 sku TEXT,
                 description TEXT,
+                desc_clean TEXT,
+                label_line1 TEXT,
+                label_line2 TEXT,
                 units_received REAL,
                 total_spend REAL,
                 last_invoice TEXT,
@@ -892,14 +915,22 @@ def init_inventory_db(dbfile: Path):
         conn.execute('CREATE INDEX IF NOT EXISTS idx_parts_removed_part_key ON parts_removed(part_key);')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_orders_vendor ON orders(vendor);')
 
+        # Ensure label columns exist (supports schema upgrades without rebuilding the DB)
+        _ensure_columns(conn, "line_items", ["desc_clean", "label_line1", "label_line2"])
+        _ensure_columns(conn, "parts_received", ["desc_clean", "label_line1", "label_line2"])
+
         # View: computed inventory (received - removed)
+        conn.execute("DROP VIEW IF EXISTS inventory_view;")
         conn.execute("""
-            CREATE VIEW IF NOT EXISTS inventory_view AS
+            CREATE VIEW inventory_view AS
             SELECT
                 pr.part_key,
                 pr.vendor,
                 pr.sku,
                 pr.description,
+                pr.desc_clean,
+                pr.label_line1,
+                pr.label_line2,
                 pr.units_received,
                 COALESCE(r.removed, 0) AS units_removed,
                 (pr.units_received - COALESCE(r.removed, 0)) AS on_hand,
