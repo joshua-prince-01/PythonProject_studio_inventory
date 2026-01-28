@@ -866,10 +866,105 @@ def vendor_mcmaster_enrich_one():
 
 
 def menu_labels():
+    db = get_db()
+
+    while True:
+        console.clear()
+        header()
+        console.print("[bold]Labels[/bold]\n")
+
+        menu = Table(show_header=False, box=None)
+        menu.add_row("1.", "Make labels PDF (from parts_received)")
+        menu.add_row("0.", "Back")
+        console.print(menu)
+
+        choice = Prompt.ask("\nChoose", choices=["1", "0"], default="1")
+        if choice == "0":
+            return
+        if choice == "1":
+            labels_make_pdf(db)
+
+from art_studio_org.labels.make_pdf import make_labels_pdf
+from pathlib import Path
+
+def labels_make_pdf(db: DB):
     console.clear()
     header()
-    console.print("[bold]Labels[/bold]\n")
-    console.print("Paused for now. Once vendor enrichment is in, labels become DB-driven.")
+    console.print("[bold]Make labels PDF[/bold]\n")
+
+    # template
+    tpl = Prompt.ask("Template file", default="label_templates/avery_5160.json")
+    tpl_path = (project_root() / tpl).resolve()
+    if not tpl_path.exists():
+        console.print(f"[red]Template not found:[/red] {tpl_path}")
+        pause()
+        return
+
+    # choose items
+    mode = Prompt.ask("Pick items by", choices=["vendor", "search", "part_keys"], default="vendor")
+    rows = []
+
+    if mode == "vendor":
+        vendor = Prompt.ask("Vendor (e.g. mcmaster, digikey)", default="mcmaster").strip()
+        rows = db.rows("""
+                       SELECT part_key,
+                              vendor,
+                              sku,
+                              label_line1,
+                              label_line2,
+                       FROM parts_received
+                       ORDER BY vendor, sku LIMIT 200
+                       """)
+
+
+    elif mode == "search":
+        term = Prompt.ask("Search term", default="").strip()
+        like = f"%{term}%"
+        rows = db.rows("""
+            SELECT part_key, vendor, sku, label_line1, label_line2, label_short, purchase_url, label_qr_text
+            FROM parts_received
+            WHERE part_key LIKE ? COLLATE NOCASE
+               OR sku LIKE ? COLLATE NOCASE
+               OR description LIKE ? COLLATE NOCASE
+               OR label_short LIKE ? COLLATE NOCASE
+            ORDER BY vendor, sku
+            LIMIT 200
+        """, [like, like, like, like])
+
+    else:
+        keys = Prompt.ask("Paste part_keys (comma-separated)", default="").strip()
+        part_keys = [k.strip() for k in keys.split(",") if k.strip()]
+        if not part_keys:
+            return
+        qmarks = ",".join(["?"] * len(part_keys))
+        rows = db.rows(f"""
+            SELECT part_key, vendor, sku, label_line1, label_line2, label_short, purchase_url, label_qr_text
+            FROM parts_received
+            WHERE part_key IN ({qmarks})
+            ORDER BY vendor, sku
+        """, part_keys)
+
+    if not rows:
+        console.print("[yellow]No items found.[/yellow]")
+        pause()
+        return
+
+    # start position + qr
+    start_pos = IntPrompt.ask("Start label position (1 = first label top-left)", default=1)
+    include_qr = Confirm.ask("Include QR code?", default=False)
+
+    outdir = exports_dir()
+    out_pdf = outdir / f"labels_{timestamp_slug()}.pdf"
+
+    make_labels_pdf(
+        template_path=tpl_path,
+        out_pdf=out_pdf,
+        rows=[dict(r) for r in rows],
+        start_pos=start_pos,
+        include_qr=include_qr,
+    )
+
+    console.print(f"[green]Wrote[/green] {out_pdf}")
     pause()
 
 
