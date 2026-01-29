@@ -20,6 +20,10 @@ from rich.table import Table
 
 from art_studio_org.db import DB, default_db_path, project_root
 
+from art_studio_org.labels.make_pdf import make_labels_pdf, LabelTemplate
+from art_studio_org.labels.presets import list_label_presets, load_label_preset, save_label_preset
+
+
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 console = Console()
 
@@ -189,7 +193,7 @@ def run_menu():
         menu.add_row("2.", "[bold]Export[/bold] data (CSV / reports)")
         menu.add_row("3.", "[bold]Inventory[/bold] browse / search / receive / remove")
         menu.add_row("4.", "[bold]Vendors[/bold] enrich (DigiKey / McMaster) [dim](coming soon)[/dim]")
-        menu.add_row("5.", "[bold]Labels[/bold] generate PDFs [dim](coming soon)[/dim]")
+        menu.add_row("5.", "[bold]Labels[/bold] generate PDFs")
         menu.add_row("6.", "DB diagnostics")
         menu.add_row("0.", "Quit")
         console.print(menu)
@@ -910,12 +914,414 @@ def menu_vendors():
     pause()
 
 
-def menu_labels():
+
+# ----------------------------
+# Labels
+# ----------------------------
+
+LABEL_SOURCES = [
+    ("label_line1", "Label line 1"),
+    ("label_line2", "Label line 2"),
+    ("label_short", "Label short"),
+    ("vendor", "Vendor"),
+    ("sku", "SKU"),
+    ("vendor_sku", "Vendor:SKU"),
+    ("purchase_url", "Purchase URL"),
+    ("label_qr_text", "Label QR text"),
+    ("part_key", "Part key"),
+]
+
+ANCHORS = ["UL","UC","UR","ML","MC","MR","LL","LC","LR"]
+ALIGNS = ["left","center","right"]
+STYLES = ["normal","bold","italic"]
+
+
+def _open_pdf(path: Path) -> None:
+    try:
+        if sys.platform.startswith("darwin"):
+            subprocess.run(["open", str(path)], check=False)
+        elif os.name == "nt":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)
+    except Exception:
+        pass
+
+
+def list_label_templates() -> list[Path]:
+    d = project_root() / "label_templates"
+    if not d.exists():
+        return []
+    return sorted(d.glob("*.json"))
+
+
+def pick_label_template() -> Path | None:
+    templates = list_label_templates()
+    if not templates:
+        console.print("[red]No templates found in label_templates/*.json[/red]")
+        pause()
+        return None
+
+    t = Table(show_header=True, header_style="bold magenta")
+    t.add_column("#", justify="right", width=3)
+    t.add_column("template")
+    t.add_column("label size", justify="right")
+    t.add_column("grid", justify="right")
+
+    for i, p in enumerate(templates, 1):
+        try:
+            tpl = LabelTemplate.from_json(p)
+            size = f'{tpl.label_w/72:.2f}"×{tpl.label_h/72:.2f}"'
+            grid = f"{tpl.cols}×{tpl.rows}"
+            name = tpl.name
+        except Exception:
+            name = p.name
+            size = ""
+            grid = ""
+        t.add_row(str(i), name + f" [dim]({p.name})[/dim]", size, grid)
+
+    console.print("[bold]Choose label template[/bold]\n")
+    console.print(t)
+    choice = IntPrompt.ask("Template #", default=1)
+    if not (1 <= choice <= len(templates)):
+        console.print("[red]Invalid choice[/red]")
+        pause()
+        return None
+    return templates[choice - 1]
+
+
+def _combine_where(base_where: str, dyn_where: str) -> str:
+    base_where = base_where or ""
+    dyn_where = dyn_where or ""
+    if not dyn_where.strip():
+        return base_where
+    if base_where.strip():
+        return base_where.rstrip() + " AND " + dyn_where.strip() + " "
+    return " WHERE " + dyn_where.strip() + " "
+
+
+def _fetch_selected_part_keys(db: DB, sel: dict) -> list[str]:
+    row_nums: list[int] = sel.get("row_nums", []) or []
+    if not row_nums:
+        return []
+    base_where = sel.get("base_where", "") or ""
+    dyn_where = sel.get("dyn_where", "") or ""
+    order_by = sel.get("order_by", "vendor, sku") or "vendor, sku"
+    base_params = sel.get("base_params", []) or []
+    dyn_params = sel.get("dyn_params", []) or []
+
+    where = _combine_where(base_where, dyn_where)
+    max_n = max(row_nums)
+    key_rows = db.rows(f"""
+        SELECT part_key
+        FROM inventory_view
+        {where}
+        ORDER BY {order_by}
+        LIMIT ?
+    """, list(base_params) + list(dyn_params) + [max_n])
+
+    part_keys: list[str] = []
+    for n in row_nums:
+        if 1 <= n <= len(key_rows):
+            part_keys.append(key_rows[n - 1]["part_key"])
+    return part_keys
+
+
+def _fetch_label_rows(db: DB, part_keys: list[str]) -> list[dict]:
+    if not part_keys:
+        return []
+    qmarks = ",".join(["?"] * len(part_keys))
+    got = db.rows(f"""
+        SELECT
+            part_key, vendor, sku,
+            label_line1, label_line2, label_short,
+            purchase_url, label_qr_text
+        FROM parts_received
+        WHERE part_key IN ({qmarks})
+    """, part_keys)
+    by_key = {r["part_key"]: dict(r) for r in got}
+    return [by_key[k] for k in part_keys if k in by_key]
+
+
+def _default_layout_for_template(tpl_path: Path) -> dict:
+    try:
+        t = LabelTemplate.from_json(tpl_path)
+        base_size = int(t.font_size)
+    except Exception:
+        base_size = 8
+
+    return {
+        "elements": [
+            {"source": "label_line1", "style": "bold", "size": base_size, "pos": "UL", "align": "left", "wrap": False, "max_lines": 1},
+            {"source": "vendor_sku", "style": "normal", "size": base_size, "pos": "LL", "align": "left", "wrap": False, "max_lines": 1},
+        ],
+        "qr": {"enabled": True, "source": "purchase_url", "pos": "UR", "size_rel": 0.45},
+    }
+
+
+def _pick_or_create_layout(tpl_path: Path) -> tuple[dict, str | None]:
+    presets = list_label_presets(project_root(), tpl_path)
+    console.print("\n[bold]Layout preset[/bold]")
+    if presets:
+        t = Table(show_header=True, header_style="bold magenta")
+        t.add_column("#", justify="right", width=3)
+        t.add_column("preset")
+        for i, p in enumerate(presets, 1):
+            t.add_row(str(i), p.stem)
+        console.print(t)
+        console.print("[dim]0 = start from default layout[/dim]")
+        idx = IntPrompt.ask("Preset #", default=0)
+        if idx == 0:
+            return _default_layout_for_template(tpl_path), None
+        if 1 <= idx <= len(presets):
+            p = presets[idx - 1]
+            try:
+                return load_label_preset(p), p.stem
+            except Exception:
+                return _default_layout_for_template(tpl_path), None
+        return _default_layout_for_template(tpl_path), None
+    else:
+        console.print("[dim]No presets yet. Starting from default.[/dim]")
+        return _default_layout_for_template(tpl_path), None
+
+
+def _edit_elements(layout: dict, tpl_font_size: int) -> None:
+    console.print("\n[bold]Available elements[/bold]")
+    t = Table(show_header=True, header_style="bold magenta")
+    t.add_column("#", justify="right", width=3)
+    t.add_column("source")
+    t.add_column("meaning")
+    for i, (k, label) in enumerate(LABEL_SOURCES, 1):
+        t.add_row(str(i), k, label)
+    console.print(t)
+
+    raw = Prompt.ask("Choose elements in order (comma list of # or names)", default="1,6").strip()
+    if not raw:
+        return
+
+    # parse selection
+    chosen: list[str] = []
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    for p in parts:
+        if p.isdigit():
+            i = int(p)
+            if 1 <= i <= len(LABEL_SOURCES):
+                chosen.append(LABEL_SOURCES[i - 1][0])
+        else:
+            chosen.append(p)
+
+    elems: list[dict] = []
+    last_style = "normal"
+    last_size = tpl_font_size
+    last_pos = "UL"
+    last_align = "left"
+    last_wrap = False
+    last_max_lines = 1
+
+    for idx, src in enumerate(chosen, 1):
+        console.print(f"\n[bold]Element {idx}[/bold] source=[cyan]{src}[/cyan]")
+        style = Prompt.ask("Style", choices=STYLES, default=last_style)
+        size = IntPrompt.ask("Font size", default=last_size)
+        pos = Prompt.ask("Position", choices=ANCHORS, default=("UL" if idx == 1 else "LL"))
+        align = Prompt.ask("Justification", choices=ALIGNS, default=last_align)
+        wrap = Confirm.ask("Wrap text?", default=last_wrap)
+        max_lines = IntPrompt.ask("Max lines", default=(2 if wrap else 1))
+
+        elems.append({
+            "source": src,
+            "style": style,
+            "size": int(size),
+            "pos": pos,
+            "align": align,
+            "wrap": bool(wrap),
+            "max_lines": int(max_lines),
+        })
+
+        last_style, last_size, last_pos, last_align, last_wrap, last_max_lines = style, int(size), pos, align, bool(wrap), int(max_lines)
+
+    layout["elements"] = elems
+
+
+def _edit_qr(layout: dict) -> None:
+    qr_cfg = dict(layout.get("qr", {}) or {})
+    enabled = Confirm.ask("QR enabled?", default=bool(qr_cfg.get("enabled", True)))
+    qr_cfg["enabled"] = enabled
+    if enabled:
+        # pick source
+        t = Table(show_header=True, header_style="bold magenta")
+        t.add_column("#", justify="right", width=3)
+        t.add_column("source")
+        for i, (k, _) in enumerate(LABEL_SOURCES, 1):
+            t.add_row(str(i), k)
+        console.print("\n[bold]QR source[/bold]")
+        console.print(t)
+        src = Prompt.ask("QR source", default=str(qr_cfg.get("source", "purchase_url"))).strip() or "purchase_url"
+        pos = Prompt.ask("QR position", choices=ANCHORS, default=str(qr_cfg.get("pos", "UR")))
+        size_rel = FloatPrompt.ask("QR size (0.2–0.9)", default=float(qr_cfg.get("size_rel", 0.45)))
+        size_rel = max(0.2, min(0.9, float(size_rel)))
+        qr_cfg.update({"source": src, "pos": pos, "size_rel": size_rel})
+    layout["qr"] = qr_cfg
+
+
+def _layout_summary(layout: dict) -> None:
+    elems = layout.get("elements", []) or []
+    qr_cfg = layout.get("qr", {}) or {}
+    console.print("\n[bold]Current layout[/bold]")
+    t = Table(show_header=True, header_style="bold magenta")
+    t.add_column("#", justify="right", width=3)
+    t.add_column("source")
+    t.add_column("style")
+    t.add_column("size", justify="right")
+    t.add_column("pos")
+    t.add_column("align")
+    t.add_column("wrap")
+    t.add_column("lines", justify="right")
+    for i, e in enumerate(elems, 1):
+        t.add_row(
+            str(i),
+            str(e.get("source","")),
+            str(e.get("style","normal")),
+            str(e.get("size","")),
+            str(e.get("pos","UL")),
+            str(e.get("align","left")),
+            "yes" if e.get("wrap") else "no",
+            str(e.get("max_lines", 1)),
+        )
+    console.print(t)
+    console.print(f"[dim]QR: enabled={qr_cfg.get('enabled', False)} source={qr_cfg.get('source','')} pos={qr_cfg.get('pos','')} size_rel={qr_cfg.get('size_rel','')}[/dim]")
+
+
+def labels_generate(db: DB):
     console.clear()
     header()
-    console.print("[bold]Labels[/bold]\n")
-    console.print("Paused for now. Once vendor enrichment is in, labels become DB-driven.")
-    pause()
+    console.print("[bold]Labels → Generate PDF[/bold]\n")
+
+    tpl_path = pick_label_template()
+    if not tpl_path:
+        return
+
+    # select items
+    console.print("[bold]Select items from inventory[/bold]")
+    console.print("[dim]Use sort keys (v/h/c/o), filter (f), then select: sel 87:200,205,206[/dim]\n")
+    sel = inv_browse(db, title="Inventory (select rows for labels)", allow_select=True)
+    if not sel:
+        return
+
+    part_keys = _fetch_selected_part_keys(db, sel)
+    if not part_keys:
+        console.print("[yellow]No valid rows selected.[/yellow]")
+        pause()
+        return
+
+    rows = _fetch_label_rows(db, part_keys)
+    if not rows:
+        console.print("[yellow]No label data found for selected items.[/yellow]")
+        pause()
+        return
+
+    # layout preset
+    layout, loaded_name = _pick_or_create_layout(tpl_path)
+
+    # template font size for defaults
+    try:
+        tpl_obj = LabelTemplate.from_json(tpl_path)
+        tpl_font_size = int(tpl_obj.font_size)
+        per_sheet = int(tpl_obj.cols * tpl_obj.rows)
+    except Exception:
+        tpl_font_size = 8
+        per_sheet = 1
+
+    used = 0
+
+    while True:
+        console.clear()
+        header()
+        console.print("[bold]Labels → Layout & Preview[/bold]")
+        console.print(f"[dim]Template:[/dim] {tpl_path.name}  |  [dim]Selected:[/dim] {len(rows)}  |  [dim]Used labels on sheet:[/dim] {used} / {per_sheet}")
+        if loaded_name:
+            console.print(f"[dim]Preset:[/dim] {loaded_name}")
+        _layout_summary(layout)
+
+        menu = Table(show_header=False, box=None)
+        menu.add_row("1.", "Edit elements")
+        menu.add_row("2.", "Edit QR")
+        menu.add_row("3.", "Set used labels on sheet")
+        menu.add_row("4.", "Preview (opens PDF)")
+        menu.add_row("5.", "Save preset")
+        menu.add_row("6.", "Export final PDF")
+        menu.add_row("0.", "Back")
+        console.print("\n", menu)
+
+        choice = Prompt.ask("Choose", choices=["1","2","3","4","5","6","0"], default="4")
+        if choice == "0":
+            return
+        elif choice == "1":
+            _edit_elements(layout, tpl_font_size)
+        elif choice == "2":
+            _edit_qr(layout)
+        elif choice == "3":
+            used = IntPrompt.ask(f"How many labels are already used on this sheet? (0–{max(0, per_sheet-1)})", default=used)
+            used = max(0, min(max(0, per_sheet-1), int(used)))
+        elif choice == "5":
+            name = Prompt.ask("Preset name", default=(loaded_name or "my_layout")).strip()
+            try:
+                p = save_label_preset(project_root(), tpl_path, name, layout)
+                loaded_name = p.stem
+                console.print(f"[green]Saved preset:[/green] {p}")
+            except Exception as e:
+                console.print(f"[red]Failed to save preset:[/red] {e}")
+            pause()
+        elif choice == "4":
+            preview_path = exports_dir() / "_labels_preview.pdf"
+            make_labels_pdf(
+                template_path=tpl_path,
+                out_pdf=preview_path,
+                rows=rows,
+                start_pos=used + 1,
+                include_qr=False,
+                layout=layout,
+                draw_boxes=False,
+            )
+            _open_pdf(preview_path)
+            pause()
+        elif choice == "6":
+            default_name = f"labels_{timestamp_slug()}.pdf"
+            name = Prompt.ask("Export filename", default=default_name).strip()
+            if not name.lower().endswith(".pdf"):
+                name += ".pdf"
+            out_pdf = exports_dir() / name
+            make_labels_pdf(
+                template_path=tpl_path,
+                out_pdf=out_pdf,
+                rows=rows,
+                start_pos=used + 1,
+                include_qr=False,
+                layout=layout,
+                draw_boxes=False,
+            )
+            _open_pdf(out_pdf)
+            console.print(f"[green]Exported:[/green] {out_pdf}")
+            pause()
+
+
+def menu_labels():
+    db = get_db()
+    while True:
+        console.clear()
+        header()
+        console.print("[bold]Labels[/bold]\n")
+
+        menu = Table(show_header=False, box=None)
+        menu.add_row("1.", "Generate labels PDF (with preview)")
+        menu.add_row("0.", "Back")
+        console.print(menu)
+
+        choice = Prompt.ask("\nChoose", choices=["1", "0"], default="1")
+        if choice == "0":
+            return
+        if choice == "1":
+            labels_generate(db)
+
 
 
 # ----------------------------
