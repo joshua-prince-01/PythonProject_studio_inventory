@@ -551,7 +551,7 @@ def inv_browse(
         elif cmd_l == "f":
             console.print("\n[bold]Filter inventory (blank clears each field)[/bold]")
             vendor_f = Prompt.ask("Vendor contains", default="").strip()
-            term_f = Prompt.ask("Search term (sku/label_short)", default="").strip()
+            term_f = Prompt.ask("Search term (vendor/sku/desc/label)", default="").strip()
             min_hand = Prompt.ask("Min on_hand", default="").strip()
             max_cost = Prompt.ask("Max avg_cost", default="").strip()
             inv_term = Prompt.ask("Last invoice contains", default="").strip()
@@ -560,11 +560,25 @@ def inv_browse(
             new_params: list = []
 
             if vendor_f:
-                clauses.append("vendor LIKE ?")
+                clauses.append("vendor LIKE ? COLLATE NOCASE")
                 new_params.append(f"%{vendor_f}%")
             if term_f:
-                clauses.append("(sku LIKE ? OR label_short LIKE ?)")
-                new_params.extend([f"%{term_f}%", f"%{term_f}%"])
+                # Broad text search across common fields (case-insensitive)
+                like = f"%{term_f}%"
+                search_cols = [
+                    "vendor",
+                    "sku",
+                    "part_key",
+                    "description",
+                    "desc_clean",
+                    "label_line1",
+                    "label_line2",
+                    "label_short",
+                    "purchase_url",
+                    "last_invoice",
+                ]
+                clauses.append("(" + " OR ".join([f"COALESCE({c}, '') LIKE ? COLLATE NOCASE" for c in search_cols]) + ")")
+                new_params.extend([like] * len(search_cols))
             if min_hand:
                 try:
                     clauses.append("on_hand >= ?")
@@ -578,7 +592,7 @@ def inv_browse(
                 except ValueError:
                     console.print("[yellow]Max avg_cost ignored (not a number).[/yellow]")
             if inv_term:
-                clauses.append("last_invoice LIKE ?")
+                clauses.append("last_invoice LIKE ? COLLATE NOCASE")
                 new_params.append(f"%{inv_term}%")
 
             if clauses:
@@ -1095,7 +1109,16 @@ def _edit_elements(layout: dict, tpl_font_size: int) -> None:
         t.add_row(str(i), k, label)
     console.print(t)
 
-    raw = Prompt.ask("Choose elements in order (comma list of # or names)", default="1,6").strip()
+    current = layout.get("elements", []) or []
+    default_raw = ",".join([str(e.get("source","")).strip() for e in current if str(e.get("source","")).strip()])
+    if not default_raw:
+        default_raw = "label_line1,vendor_sku"
+
+    raw = Prompt.ask(
+        "Choose elements in order (comma list of # or names)",
+        default=default_raw
+    ).strip()
+
     if not raw:
         return
 
@@ -1110,22 +1133,37 @@ def _edit_elements(layout: dict, tpl_font_size: int) -> None:
         else:
             chosen.append(p)
 
+    # defaults from existing layout (by source)
+    by_source: dict[str, dict] = {}
+    for e in current:
+        s = str(e.get("source","")).strip()
+        if s and s not in by_source:
+            by_source[s] = e
+
     elems: list[dict] = []
-    last_style = "normal"
-    last_size = tpl_font_size
-    last_pos = "UL"
-    last_align = "left"
-    last_wrap = False
-    last_max_lines = 1
 
     for idx, src in enumerate(chosen, 1):
+        # try to inherit defaults from existing element
+        existing = by_source.get(src)
+        if existing is None and idx - 1 < len(current):
+            existing = current[idx - 1]
+
+        d_style = str((existing or {}).get("style", "bold" if idx == 1 else "normal"))
+        d_size = int((existing or {}).get("size", tpl_font_size))
+        d_pos = str((existing or {}).get("pos", "UL" if idx == 1 else "LL"))
+        d_align = str((existing or {}).get("align", "left"))
+        d_wrap = bool((existing or {}).get("wrap", False))
+        d_lines = int((existing or {}).get("max_lines", 2 if d_wrap else 1))
+        d_lines = max(1, d_lines)
+
         console.print(f"\n[bold]Element {idx}[/bold] source=[cyan]{src}[/cyan]")
-        style = Prompt.ask("Style", choices=STYLES, default=last_style)
-        size = IntPrompt.ask("Font size", default=last_size)
-        pos = Prompt.ask("Position", choices=ANCHORS, default=("UL" if idx == 1 else "LL"))
-        align = Prompt.ask("Justification", choices=ALIGNS, default=last_align)
-        wrap = Confirm.ask("Wrap text?", default=last_wrap)
-        max_lines = IntPrompt.ask("Max lines", default=(2 if wrap else 1))
+        style = Prompt.ask("Style", choices=STYLES, default=d_style)
+        size = IntPrompt.ask("Font size", default=d_size)
+        pos = Prompt.ask("Position", choices=ANCHORS, default=d_pos)
+        align = Prompt.ask("Justification", choices=ALIGNS, default=d_align)
+        wrap = Confirm.ask("Wrap text?", default=d_wrap)
+        max_lines = IntPrompt.ask("Max lines", default=(d_lines if wrap else 1))
+        max_lines = max(1, int(max_lines))
 
         elems.append({
             "source": src,
@@ -1137,10 +1175,7 @@ def _edit_elements(layout: dict, tpl_font_size: int) -> None:
             "max_lines": int(max_lines),
         })
 
-        last_style, last_size, last_pos, last_align, last_wrap, last_max_lines = style, int(size), pos, align, bool(wrap), int(max_lines)
-
     layout["elements"] = elems
-
 
 def _edit_qr(layout: dict) -> None:
     qr_cfg = dict(layout.get("qr", {}) or {})
