@@ -62,19 +62,11 @@ class RunLogger:
         self.log(f"ERROR: {context}")
         self.log(traceback.format_exc())
 
-def workspace_root() -> Path:
-    """Runtime data root. Defaults to ~/StudioInventory; override with STUDIO_INV_HOME."""
-    env = os.getenv("STUDIO_INV_HOME")
-    if env:
-        return Path(env).expanduser().resolve()
-    return (Path.home() / "StudioInventory").resolve()
-
 def project_root() -> Path:
-    """Best-effort repo root when running from source."""
     return Path(__file__).resolve().parents[1]
 
 def create_run_log(echo: bool = True) -> RunLogger:
-    root = workspace_root()
+    root = project_root()
     log_dir = root / "log"
     log_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -881,7 +873,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
 
 def db_path() -> Path:
     # Single project DB file (auto-created on first run)
-    return workspace_root() / "studio_inventory.sqlite"
+    return project_root() / "studio_inventory.sqlite"
 
 def _ensure_table(conn: sqlite3.Connection, table: str, pk_col: str):
     conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ("{pk_col}" TEXT PRIMARY KEY);')
@@ -1212,7 +1204,7 @@ def main():
         # this was commented out becuase it would place the default folder inside where we grabbed reciepts, not
         # the default 'exports' folder of the project:
         #default_export_dir = (receipts_folder.parent / "exports").resolve()
-        default_export_dir = (workspace_root() / "exports").resolve()
+        default_export_dir = (project_root() / "exports").resolve()
 
         logger.log(f"Default export dir: {default_export_dir}")
 

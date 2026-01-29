@@ -1526,84 +1526,16 @@ def menu_labels():
 
 
 # ----------------------------
-# Subcommands
+# Placeholder subcommands
 # ----------------------------
+@app.command()
+def ingest():
+    console.print("Use the menu for now. (Subcommands coming soon.)")
 
 
 @app.command()
-def ingest(
-    workspace: Optional[Path] = typer.Option(
-        None,
-        "--workspace",
-        "-w",
-        help="Workspace root (defaults to ~/StudioInventory or STUDIO_INV_HOME).",
-    )
-):
-    """Ingest receipts / packing lists (interactive)."""
-    if workspace:
-        os.environ["STUDIO_INV_HOME"] = str(Path(workspace).expanduser().resolve())
-    ensure_workspace()
-    run_legacy_ingest()
-
-
-@app.command()
-def export(
-    object_name: Optional[str] = typer.Option(
-        None,
-        "--object",
-        "-o",
-        help="SQLite table/view name to export as CSV (e.g. parts, orders, line_items).",
-    ),
-    out: Optional[Path] = typer.Option(
-        None,
-        "--out",
-        "-O",
-        help="Output CSV path. Default: <workspace>/exports/<object>_<timestamp>.csv",
-    ),
-    list_objects: bool = typer.Option(
-        False,
-        "--list",
-        help="List SQLite tables/views, then exit.",
-    ),
-    db_path: Optional[Path] = typer.Option(
-        None,
-        "--db",
-        help="Path to SQLite database. Default: <workspace>/studio_inventory.sqlite",
-    ),
-):
-    """Export a table/view to CSV (non-interactive)."""
-    ensure_workspace()
-    db = get_db(db_path)
-
-    if list_objects:
-        objs = db.rows(
-            """
-            SELECT name, type
-            FROM sqlite_master
-            WHERE type IN ('table','view')
-              AND name NOT LIKE 'sqlite_%'
-            ORDER BY type, name
-            """
-        )
-        t = Table(title="SQLite objects")
-        t.add_column("Type", style="dim")
-        t.add_column("Name")
-        for r in objs:
-            t.add_row(str(r["type"]), str(r["name"]))
-        console.print(t)
-        return
-
-    if not object_name:
-        console.print("[red]Missing --object.[/red] Try: studio-inventory export --list")
-        raise typer.Exit(code=2)
-
-    out_path = (
-        Path(out).expanduser().resolve()
-        if out
-        else exports_dir() / f"{object_name}_{timestamp_slug()}.csv"
-    )
-
-    export_sqlite_object_to_csv(db, object_name, out_path)
+def export():
+    console.print("Use the menu for now. (Subcommands coming soon.)")
 
 @app.command()
 def init():
