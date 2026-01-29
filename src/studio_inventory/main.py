@@ -1,5 +1,5 @@
-# art_studio_org/main.py
-# Unified CLI ingest for multiple vendors via art_studio_org.vendors.registry.pick_parser
+# studio_inventory/main.py
+# Unified CLI ingest for multiple vendors via studio_inventory.vendors.registry.pick_parser
 # Includes per-run log file written to project_root/log/
 
 from __future__ import annotations
@@ -17,11 +17,26 @@ import os
 from urllib.parse import quote_plus
 import pandas as pd
 
-from art_studio_org.vendors.registry import pick_parser
+from studio_inventory.vendors.registry import pick_parser
 
 # ----------------------------
 # Simple run logger
 # ----------------------------
+
+
+# ----------------------------
+# Quiet noisy PDF font warnings (pdfminer)
+# ----------------------------
+import logging
+
+def suppress_pdfminer_font_warnings() -> None:
+    """Silence pdfminer warnings like 'Could not get FontBBox...'."""
+    for name in ("pdfminer", "pdfminer.pdffont", "pdfminer.psparser", "pdfminer.pdfinterp"):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.ERROR)
+        logger.propagate = False
+
+suppress_pdfminer_font_warnings()
 
 class RunLogger:
     def __init__(self, log_path: Path, echo: bool = True):

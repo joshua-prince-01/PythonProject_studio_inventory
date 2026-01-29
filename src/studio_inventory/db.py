@@ -7,7 +7,7 @@ from typing import Iterable, Optional, Any
 
 
 def project_root() -> Path:
-    # art_studio_org/ is one level down from project root
+    # studio_inventory/ is one level down from project root
     return Path(__file__).resolve().parents[1]
 
 

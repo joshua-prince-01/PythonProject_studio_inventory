@@ -1,16 +1,34 @@
 from __future__ import annotations
-
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Sequence, Any
+from typing import Optional, Any
 from uuid import uuid4
 
 import csv
-import json
 import os
 import subprocess
 import sys
+
+
+# ----------------------------
+# Workspace (runtime data) paths
+# ----------------------------
+def workspace_root() -> Path:
+    """Runtime data folder. Defaults to ~/StudioInventory.
+    Override with STUDIO_INV_HOME=/path.
+    """
+    env = os.getenv("STUDIO_INV_HOME")
+    if env:
+        return Path(env).expanduser().resolve()
+    return (Path.home() / "StudioInventory").resolve()
+
+
+def ensure_workspace() -> Path:
+    root = workspace_root()
+    root.mkdir(parents=True, exist_ok=True)
+    for sub in ["receipts", "exports", "log", "label_presets", "secrets"]:
+        (root / sub).mkdir(exist_ok=True)
+    return root
 
 import typer
 from rich.console import Console
@@ -18,10 +36,10 @@ from rich.panel import Panel
 from rich.prompt import Prompt, IntPrompt, FloatPrompt, Confirm
 from rich.table import Table
 
-from art_studio_org.db import DB, default_db_path, project_root
+from studio_inventory.db import DB, default_db_path, project_root
 
-from art_studio_org.labels.make_pdf import make_labels_pdf, LabelTemplate
-from art_studio_org.labels.presets import list_label_presets, load_label_preset, save_label_preset
+from studio_inventory.labels.make_pdf import make_labels_pdf, LabelTemplate
+from studio_inventory.labels.presets import list_label_presets, load_label_preset, save_label_preset
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=False)
@@ -140,15 +158,15 @@ def run_legacy_ingest() -> None:
     Tries the most likely current entrypoint first.
     """
     # 1) Try the existing "main" flow
-    rc = run_module_in_subprocess("art_studio_org.main")
+    rc = run_module_in_subprocess("studio_inventory.main")
     if rc == 0:
         console.print("[green]Ingest completed.[/green]")
         return
 
-    console.print(f"[yellow]art_studio_org.main exited with code {rc}. Trying fallback…[/yellow]")
+    console.print(f"[yellow]studio_inventory.main exited with code {rc}. Trying fallback…[/yellow]")
 
     # 2) Fallback: ingest_all
-    rc2 = run_module_in_subprocess("art_studio_org.ingest_all")
+    rc2 = run_module_in_subprocess("studio_inventory.ingest_all")
     if rc2 == 0:
         console.print("[green]Ingest completed.[/green]")
         return
@@ -1518,6 +1536,23 @@ def ingest():
 @app.command()
 def export():
     console.print("Use the menu for now. (Subcommands coming soon.)")
+
+@app.command()
+def init():
+    """
+    Initialize the StudioInventory workspace in ~/StudioInventory
+    """
+    root = ensure_workspace()
+
+    typer.echo("✅ StudioInventory workspace initialized")
+    typer.echo(f"📁 Location: {root}")
+    typer.echo("")
+    typer.echo("Created (if missing):")
+    typer.echo("  - receipts/")
+    typer.echo("  - exports/")
+    typer.echo("  - log/")
+    typer.echo("  - label_presets/")
+    typer.echo("  - secrets/")
 
 
 if __name__ == "__main__":

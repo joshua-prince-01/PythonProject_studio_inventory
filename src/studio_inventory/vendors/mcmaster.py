@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import List, Dict, Any
 import pdfplumber
 
-from art_studio_org.Read_Order_Details import extract_order_info_by_page
-from art_studio_org.Read_Line_Items import parse_receipt
+from studio_inventory.Read_Order_Details import extract_order_info_by_page
+from studio_inventory.Read_Line_Items import parse_receipt
 
 
 def detect(pdf_path: str) -> bool:
