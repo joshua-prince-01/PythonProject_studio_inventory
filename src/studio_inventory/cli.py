@@ -63,45 +63,6 @@ def ensure_inventory_events_table(db: DB) -> None:
         """
     )
 
-
-def _table_exists(db: DB, table: str) -> bool:
-    try:
-        return bool(db.scalar("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", [table]))
-    except Exception:
-        return False
-
-def _columns(db: DB, table: str) -> set[str]:
-    try:
-        rows = db.rows(f'PRAGMA table_info("{table}")')
-        return {r["name"] for r in rows}
-    except Exception:
-        return set()
-
-def _ensure_column(db: DB, table: str, col: str, col_type: str) -> None:
-    cols = _columns(db, table)
-    if col in cols:
-        return
-    db.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {col_type}')
-
-def ensure_orders_ingest_schema(db: DB) -> None:
-    """Make older DBs forward-compatible with new ingest metadata columns."""
-    if _table_exists(db, "orders"):
-        for col, typ in [
-            ("archived_path", "TEXT"),
-            ("original_path", "TEXT"),
-            ("order_ref", "TEXT"),
-        ]:
-            _ensure_column(db, "orders", col, typ)
-
-    if _table_exists(db, "ingested_files"):
-        for col, typ in [
-            ("archived_path", "TEXT"),
-            ("original_path", "TEXT"),
-            ("vendor", "TEXT"),
-            ("order_ref", "TEXT"),
-        ]:
-            _ensure_column(db, "ingested_files", col, typ)
-
 def header():
     console.print(Panel.fit("[bold]Studio Inventory[/bold]\nMenu-first CLI", border_style="cyan"))
 
@@ -112,16 +73,67 @@ def pause():
 def get_db(db_path: Optional[Path] = None) -> DB:
     return DB(path=db_path or default_db_path())
 
-def row_get(row, key, default=None):
-    """sqlite3.Row-safe getter."""
-    try:
-        # sqlite3.Row supports dict-style access
-        return row[key]
-    except Exception:
-        return default
-
 def safe_str(v) -> str:
     return "" if v is None else str(v)
+
+
+def row_get(row: Any, key: str, default=None):
+    """Safe getter for sqlite3.Row (and dict-like objects)."""
+    try:
+        return row[key]  # sqlite3.Row supports mapping access
+    except Exception:
+        try:
+            return row.get(key, default)  # type: ignore[attr-defined]
+        except Exception:
+            return default
+
+
+def _table_exists(db: DB, table: str) -> bool:
+    try:
+        return db.scalar("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", [table]) is not None
+    except Exception:
+        return False
+
+
+def _table_columns(db: DB, table: str) -> set[str]:
+    if not _table_exists(db, table):
+        return set()
+    with db.connect() as con:
+        rows = con.execute(f'PRAGMA table_info("{table}");').fetchall()
+    return {r[1] for r in rows}  # (cid, name, type, notnull, dflt_value, pk)
+
+
+def _ensure_columns(db: DB, table: str, cols: dict[str, str]) -> None:
+    existing = _table_columns(db, table)
+    if not existing:
+        return
+    with db.connect() as con:
+        for col, coltype in cols.items():
+            if col in existing:
+                continue
+            try:
+                con.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {coltype};')
+            except Exception:
+                # Ignore if already exists/locked; caller queries should be defensive.
+                pass
+
+
+def ensure_orders_ingest_schema(db: DB) -> None:
+    """Forward-compatible schema for archived import paths + ingest metadata."""
+    # Orders table
+    _ensure_columns(db, "orders", {
+        "archived_path": "TEXT",
+        "original_path": "TEXT",
+        "order_ref": "TEXT",
+    })
+    # Ingested files table (duplicate stopper)
+    _ensure_columns(db, "ingested_files", {
+        "vendor": "TEXT",
+        "order_ref": "TEXT",
+        "original_path": "TEXT",
+        "archived_path": "TEXT",
+    })
+
 
 def fmt_money(v) -> str:
     try:
@@ -262,11 +274,11 @@ def run_menu():
         header()
 
         menu = Table(show_header=False, box=None)
-        menu.add_row("1.", "[bold]Orders[/bold] | View or ingest receipts / packing lists")
-        menu.add_row("2.", "[bold]Export[/bold] | data (CSV / reports)")
-        menu.add_row("3.", "[bold]Inventory[/bold] | browse / search / receive / remove")
-        menu.add_row("4.", "[bold]Vendors[/bold] | enrich (DigiKey / McMaster) [dim](coming soon)[/dim]")
-        menu.add_row("5.", "[bold]Labels[/bold] | generate PDFs")
+        menu.add_row("1.", "[bold]Ingest[/bold] receipts / packing lists")
+        menu.add_row("2.", "[bold]Export[/bold] data (CSV / reports)")
+        menu.add_row("3.", "[bold]Inventory[/bold] browse / search / receive / remove")
+        menu.add_row("4.", "[bold]Vendors[/bold] enrich (DigiKey / McMaster) [dim](coming soon)[/dim]")
+        menu.add_row("5.", "[bold]Labels[/bold] generate PDFs")
         menu.add_row("6.", "DB diagnostics")
         menu.add_row("0.", "Quit")
         console.print(menu)
@@ -323,15 +335,15 @@ def menu_ingest():
 
 
 def show_recent_ingests(db: DB):
+    ensure_orders_ingest_schema(db)
+    if not _table_exists(db, "ingested_files"):
+        console.print("[yellow]No ingested file history yet. Run an ingest first.[/yellow]")
+        pause()
+        return
+
     console.clear()
     header()
     console.print("[bold]Recent ingests[/bold]\n")
-
-    ensure_orders_ingest_schema(db)
-    if not _table_exists(db, "ingested_files"):
-        console.print("[yellow]No ingested files yet.[/yellow] Run an ingest first.")
-        pause()
-        return
 
     try:
         rows = db.rows("""
@@ -353,13 +365,13 @@ def show_recent_ingests(db: DB):
     t.add_column("original_path")
 
     for r in rows:
-        archived = safe_str(row_get("archived_path"))
+        archived = safe_str(row_get(r, "archived_path"))
         t.add_row(
-            safe_str(row_get("first_seen_utc")),
-            safe_str(row_get("vendor")),
-            safe_str(row_get("order_ref")),
+            safe_str(row_get(r, "first_seen_utc")),
+            safe_str(row_get(r, "vendor")),
+            safe_str(row_get(r, "order_ref")),
             "✅" if archived else "",
-            shorten(row_get("original_path"), 80),
+            shorten(row_get(r, "original_path"), 80),
         )
 
     console.print(t)
@@ -374,17 +386,17 @@ def _orders_where(filters: dict[str, str]) -> tuple[str, list[str]]:
     wh = []
     params: list[str] = []
 
-    v = (filters.get("vendor") or "").strip()
+    v = (row_get(filters, "vendor") or "").strip()
     if v:
         wh.append("o.vendor LIKE ?")
         params.append(f"%{v}%")
 
-    oid = (filters.get("order_id") or "").strip()
+    oid = (row_get(filters, "order_id") or "").strip()
     if oid:
         wh.append("o.order_id LIKE ?")
         params.append(f"%{oid}%")
 
-    d = (filters.get("date") or "").strip()
+    d = (row_get(filters, "date") or "").strip()
     if d:
         wh.append("o.order_date LIKE ?")
         params.append(f"%{d}%")
@@ -421,14 +433,14 @@ def _orders_sort_prompt() -> str:
 
 
 def orders_browse(db: DB, *, page_size: int = 20) -> None:
-    if not db.path.exists():
-        console.print(f"[red]DB not found:[/red] {db.path}")
+    ensure_orders_ingest_schema(db)
+    if not _table_exists(db, "orders"):
+        console.print("[yellow]No orders have been ingested yet. Run an ingest first.[/yellow]")
         pause()
         return
 
-    ensure_orders_ingest_schema(db)
-    if not _table_exists(db, "orders"):
-        console.print("[yellow]No orders have been ingested yet.[/yellow] Run an ingest first.")
+    if not db.path.exists():
+        console.print(f"[red]DB not found:[/red] {db.path}")
         pause()
         return
 
@@ -488,14 +500,12 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
 
         for i, r in enumerate(rows, start=1):
             arch = safe_str(row_get(r, "archived_path"))
-            total_val = row_get(r, "total")
-            total_s = "" if total_val is None else f"{float(total_val):,.2f}"
-
+            total_s = "" if row_get(r, "total") is None else f"{float(row_get(r, 'total')):,.2f}"
             t.add_row(
                 str(i),
-                safe_str(row_get("vendor")),
-                safe_str(row_get("order_id") or row_get("order_ref") or ""),
-                safe_str(row_get("order_date")),
+                safe_str(row_get(r, "vendor")),
+                safe_str(row_get(r, "order_id") or row_get(r, "order_ref") or ""),
+                safe_str(row_get(r, "order_date")),
                 total_s,
                 "✅" if arch else "",
             )
@@ -537,6 +547,7 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
 
 
 def _show_order_details(db: DB, order_uid: str) -> None:
+    ensure_orders_ingest_schema(db)
     while True:
         console.clear()
         header()
@@ -561,16 +572,16 @@ def _show_order_details(db: DB, order_uid: str) -> None:
             return
         o = o[0]
 
-        archived = safe_str(o.get("archived_path"))
-        original = safe_str(o.get("original_path"))
+        archived = safe_str(row_get(o, "archived_path"))
+        original = safe_str(row_get(o, "original_path"))
 
         body = []
-        body.append(f"[bold]Vendor:[/bold] {safe_str(o.get('vendor'))}")
-        body.append(f"[bold]Order:[/bold] {safe_str(o.get('order_id') or o.get('order_ref') or '')}")
-        body.append(f"[bold]Order date:[/bold] {safe_str(o.get('order_date'))}")
-        body.append(f"[bold]Ingested:[/bold] {safe_str(o.get('first_seen_utc'))}")
-        body.append(f"[bold]Total:[/bold] {safe_str(o.get('total'))}")
-        body.append(f"[bold]File hash:[/bold] {safe_str(o.get('file_hash'))}")
+        body.append(f"[bold]Vendor:[/bold] {safe_str(row_get(o, 'vendor'))}")
+        body.append(f"[bold]Order:[/bold] {safe_str(row_get(o, 'order_id') or row_get(o, 'order_ref') or '')}")
+        body.append(f"[bold]Order date:[/bold] {safe_str(row_get(o, 'order_date'))}")
+        body.append(f"[bold]Ingested:[/bold] {safe_str(row_get(o, 'first_seen_utc'))}")
+        body.append(f"[bold]Total:[/bold] {safe_str(row_get(o, 'total'))}")
+        body.append(f"[bold]File hash:[/bold] {safe_str(row_get(o, 'file_hash'))}")
         if archived:
             body.append(f"[bold]Archived PDF:[/bold] {archived}")
         if original:
@@ -599,12 +610,12 @@ def _show_order_details(db: DB, order_uid: str) -> None:
 
         for r in items:
             it.add_row(
-                safe_str(row_get("line")),
-                safe_str(row_get("sku")),
-                shorten(row_get("description"), 60),
-                safe_str(row_get("units_received") or row_get("shipped") or row_get("ordered") or ""),
-                safe_str(row_get("unit_price") or ""),
-                safe_str(row_get("line_total") or ""),
+                safe_str(row_get(r, "line")),
+                safe_str(row_get(r, "sku")),
+                shorten(row_get(r, "description"), 60),
+                safe_str(row_get(r, "units_received") or row_get(r, "shipped") or row_get(r, "ordered") or ""),
+                safe_str(row_get(r, "unit_price") or ""),
+                safe_str(row_get(r, "line_total") or ""),
             )
 
         console.print(it)
@@ -1858,7 +1869,7 @@ def _layout_summary(layout: dict) -> None:
             str(e.get("pos","UL")),
             str(e.get("span", 1)),
             str(e.get("align","left")),
-            "yes" if e.get("wrap") else "no",
+            "yes" if row_get(e, "wrap") else "no",
             str(e.get("max_lines", 1)),
         )
     console.print(t)
