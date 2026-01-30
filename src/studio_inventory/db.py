@@ -11,29 +11,7 @@ from typing import Iterable, Optional, Any
 # ----------------------------
 # Roots / paths
 # ----------------------------
-def workspace_root() -> Path:
-    """
-    Runtime data folder.
-
-    Defaults to ~/StudioInventory
-    Override with STUDIO_INV_HOME=/path
-    """
-    env = os.getenv("STUDIO_INV_HOME")
-    if env:
-        return Path(env).expanduser().resolve()
-    return (Path.home() / "StudioInventory").resolve()
-
-
-def project_root() -> Path:
-    """
-    Best-effort repo root when running from source.
-
-    Note: once installed into site-packages, this will point inside the install
-    location and should NOT be used for writable data paths.
-    """
-    # src/studio_inventory/db.py -> parents[2] == repo root
-    p = Path(__file__).resolve()
-    return p.parents[2] if len(p.parents) >= 3 else p.parent
+from studio_inventory.paths import workspace_root, project_root
 
 
 def default_db_path() -> Path:

@@ -13,22 +13,16 @@ import sys
 # ----------------------------
 # Workspace (runtime data) paths
 # ----------------------------
-def workspace_root() -> Path:
-    """Runtime data folder. Defaults to ~/StudioInventory.
-    Override with STUDIO_INV_HOME=/path.
-    """
-    env = os.getenv("STUDIO_INV_HOME")
-    if env:
-        return Path(env).expanduser().resolve()
-    return (Path.home() / "StudioInventory").resolve()
-
-
-def ensure_workspace() -> Path:
-    root = workspace_root()
-    root.mkdir(parents=True, exist_ok=True)
-    for sub in ["receipts", "exports", "log", "label_presets", "secrets"]:
-        (root / sub).mkdir(exist_ok=True)
-    return root
+from studio_inventory.paths import (
+    workspace_root,
+    ensure_workspace,
+    exports_dir,
+    receipts_dir,
+    log_dir,
+    label_presets_dir,
+    secrets_dir,
+    project_root,
+)
 
 import typer
 from rich.console import Console
@@ -36,7 +30,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt, IntPrompt, FloatPrompt, Confirm
 from rich.table import Table
 
-from studio_inventory.db import DB, default_db_path, project_root
+from studio_inventory.db import DB, default_db_path
 
 from studio_inventory.labels.make_pdf import make_labels_pdf, LabelTemplate
 from studio_inventory.labels.presets import list_label_presets, load_label_preset, save_label_preset
@@ -121,10 +115,6 @@ def parse_row_spec(spec: str) -> list[int]:
             seen.add(n)
     return uniq
 
-def exports_dir() -> Path:
-    d = workspace_root() / "exports"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
 
 def timestamp_slug() -> str:
     # local time is fine for filenames

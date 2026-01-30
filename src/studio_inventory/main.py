@@ -18,6 +18,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 
 from studio_inventory.vendors.registry import pick_parser
+from studio_inventory.paths import workspace_root, log_dir, receipts_dir, project_root
 
 # ----------------------------
 # Simple run logger
@@ -62,26 +63,14 @@ class RunLogger:
         self.log(f"ERROR: {context}")
         self.log(traceback.format_exc())
 
-def workspace_root() -> Path:
-    """Runtime data root. Defaults to ~/StudioInventory; override with STUDIO_INV_HOME."""
-    env = os.getenv("STUDIO_INV_HOME")
-    if env:
-        return Path(env).expanduser().resolve()
-    return (Path.home() / "StudioInventory").resolve()
-
-def project_root() -> Path:
-    """Best-effort repo root when running from source."""
-    return Path(__file__).resolve().parents[1]
-
 def create_run_log(echo: bool = True) -> RunLogger:
     root = workspace_root()
-    log_dir = root / "log"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir_path = log_dir()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = log_dir / f"run_{stamp}.txt"
+    log_path = log_dir_path / f"run_{stamp}.txt"
     logger = RunLogger(log_path=log_path, echo=echo)
     logger.log(f"Log file: {log_path}")
-    logger.log(f"Project root: {root}")
+    logger.log(f"Workspace root: {root}")
     logger.log(f"CWD: {Path.cwd().resolve()}")
     return logger
 
