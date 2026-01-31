@@ -76,6 +76,77 @@ def get_db(db_path: Optional[Path] = None) -> DB:
 def safe_str(v) -> str:
     return "" if v is None else str(v)
 
+
+def row_get(row: Any, key: str, default=None):
+    """Safe getter for sqlite3.Row (and dict-like objects)."""
+    try:
+        return row[key]  # sqlite3.Row supports mapping access
+    except Exception:
+        try:
+            return row.get(key, default)  # type: ignore[attr-defined]
+        except Exception:
+            return default
+
+
+def _table_exists(db: DB, table: str) -> bool:
+    try:
+        return db.scalar("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", [table]) is not None
+    except Exception:
+        return False
+
+
+def _table_columns(db: DB, table: str) -> set[str]:
+    if not _table_exists(db, table):
+        return set()
+    with db.connect() as con:
+        rows = con.execute(f'PRAGMA table_info("{table}");').fetchall()
+    return {r[1] for r in rows}  # (cid, name, type, notnull, dflt_value, pk)
+
+
+def _ensure_columns(db: DB, table: str, cols: dict[str, str]) -> None:
+    existing = _table_columns(db, table)
+    if not existing:
+        return
+    with db.connect() as con:
+        for col, coltype in cols.items():
+            if col in existing:
+                continue
+            try:
+                con.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {coltype};')
+            except Exception:
+                # Ignore if already exists/locked; caller queries should be defensive.
+                pass
+
+
+def ensure_orders_ingest_schema(db: DB) -> None:
+    """Forward-compatible schema for archived import paths + ingest metadata."""
+    # Orders table
+    _ensure_columns(db, "orders", {
+        "archived_path": "TEXT",
+        "original_path": "TEXT",
+        "order_ref": "TEXT",
+        # soft-delete / void support
+        "is_voided": "INTEGER DEFAULT 0",
+        "voided_utc": "TEXT",
+    })
+    # Ingested files table (duplicate stopper)
+    _ensure_columns(db, "ingested_files", {
+        "vendor": "TEXT",
+        "order_ref": "TEXT",
+        "original_path": "TEXT",
+        "archived_path": "TEXT",
+        # optional: keep hash but mark inactive
+        "is_voided": "INTEGER DEFAULT 0",
+    })
+    # Removals table: allow order-level reversals / auditing
+    _ensure_columns(db, "parts_removed", {
+        "order_uid": "TEXT",
+        "file_hash": "TEXT",
+        "reason": "TEXT",
+    })
+
+
+
 def fmt_money(v) -> str:
     try:
         return f"{float(v):,.2f}"
@@ -215,11 +286,11 @@ def run_menu():
         header()
 
         menu = Table(show_header=False, box=None)
-        menu.add_row("1.", "[bold]Orders[/bold] [dim] ingest receipts / packing lists[/dim]")
-        menu.add_row("2.", "[bold]Export[/bold] [dim]data (CSV / reports)[/dim]")
-        menu.add_row("3.", "[bold]Inventory[/bold] [dim]browse / search / receive / remove[/dim]")
-        menu.add_row("4.", "[bold]Vendors[/bold] [dim]enrich (DigiKey / McMaster) (coming soon)[/dim]")
-        menu.add_row("5.", "[bold]Labels[/bold] [dim]generate PDFs[/dim]")
+        menu.add_row("1.", "[bold]Orders[/bold] | ingest/review: receipts / packing lists")
+        menu.add_row("2.", "[bold]Export[/bold] | make: data (CSV / reports)")
+        menu.add_row("3.", "[bold]Inventory[/bold] | browse / search / receive / remove")
+        menu.add_row("4.", "[bold]Vendors[/bold] | enrich: (DigiKey / McMaster) [dim](coming soon)[/dim]")
+        menu.add_row("5.", "[bold]Labels[/bold] | generate PDFs")
         menu.add_row("6.", "DB diagnostics")
         menu.add_row("0.", "Quit")
         console.print(menu)
@@ -276,6 +347,12 @@ def menu_ingest():
 
 
 def show_recent_ingests(db: DB):
+    ensure_orders_ingest_schema(db)
+    if not _table_exists(db, "ingested_files"):
+        console.print("[yellow]No ingested file history yet. Run an ingest first.[/yellow]")
+        pause()
+        return
+
     console.clear()
     header()
     console.print("[bold]Recent ingests[/bold]\n")
@@ -300,13 +377,13 @@ def show_recent_ingests(db: DB):
     t.add_column("original_path")
 
     for r in rows:
-        archived = safe_str(r.get("archived_path"))
+        archived = safe_str(row_get(r, "archived_path"))
         t.add_row(
-            safe_str(r.get("first_seen_utc")),
-            safe_str(r.get("vendor")),
-            safe_str(r.get("order_ref")),
+            safe_str(row_get(r, "first_seen_utc")),
+            safe_str(row_get(r, "vendor")),
+            safe_str(row_get(r, "order_ref")),
             "✅" if archived else "",
-            shorten(r.get("original_path"), 80),
+            shorten(row_get(r, "original_path"), 80),
         )
 
     console.print(t)
@@ -321,17 +398,17 @@ def _orders_where(filters: dict[str, str]) -> tuple[str, list[str]]:
     wh = []
     params: list[str] = []
 
-    v = (filters.get("vendor") or "").strip()
+    v = (row_get(filters, "vendor") or "").strip()
     if v:
         wh.append("o.vendor LIKE ?")
         params.append(f"%{v}%")
 
-    oid = (filters.get("order_id") or "").strip()
+    oid = (row_get(filters, "order_id") or "").strip()
     if oid:
         wh.append("o.order_id LIKE ?")
         params.append(f"%{oid}%")
 
-    d = (filters.get("date") or "").strip()
+    d = (row_get(filters, "date") or "").strip()
     if d:
         wh.append("o.order_date LIKE ?")
         params.append(f"%{d}%")
@@ -368,6 +445,12 @@ def _orders_sort_prompt() -> str:
 
 
 def orders_browse(db: DB, *, page_size: int = 20) -> None:
+    ensure_orders_ingest_schema(db)
+    if not _table_exists(db, "orders"):
+        console.print("[yellow]No orders have been ingested yet. Run an ingest first.[/yellow]")
+        pause()
+        return
+
     if not db.path.exists():
         console.print(f"[red]DB not found:[/red] {db.path}")
         pause()
@@ -380,7 +463,7 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
     while True:
         console.clear()
         header()
-        console.print("[bold]Orders / receipts[/bold]  [dim](row # details; n/p page; f filter; s sort; q back)[/dim]\n")
+        console.print("[bold]Orders / receipts[/bold]  (row # details; n/p page; f filter; s sort; q back)\n")
 
         where, params = _orders_where(filters)
 
@@ -406,6 +489,7 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
                 o.order_date,
                 o.total,
                 o.file_hash,
+                COALESCE(o.is_voided,0) AS is_voided,
                 i.first_seen_utc,
                 COALESCE(o.archived_path, i.archived_path) AS archived_path,
                 COALESCE(o.original_path, i.original_path) AS original_path,
@@ -424,17 +508,19 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
         t.add_column("vendor", width=16)
         t.add_column("order", width=14)
         t.add_column("date", width=12)
+        t.add_column("status", width=6)
         t.add_column("total", justify="right", width=10)
         t.add_column("arch", width=4)
 
         for i, r in enumerate(rows, start=1):
-            arch = safe_str(r.get("archived_path"))
-            total_s = "" if r.get("total") is None else f"{float(r.get('total')):,.2f}"
+            arch = safe_str(row_get(r, "archived_path"))
+            total_s = "" if row_get(r, "total") is None else f"{float(row_get(r, 'total')):,.2f}"
             t.add_row(
                 str(i),
-                safe_str(r.get("vendor")),
-                safe_str(r.get("order_id") or r.get("order_ref") or ""),
-                safe_str(r.get("order_date")),
+                safe_str(row_get(r, "vendor")),
+                safe_str(row_get(r, "order_id") or row_get(r, "order_ref") or ""),
+                safe_str(row_get(r, "order_date")),
+                ("VOID" if int(row_get(r, "is_voided") or 0) else ""),
                 total_s,
                 "✅" if arch else "",
             )
@@ -476,6 +562,7 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
 
 
 def _show_order_details(db: DB, order_uid: str) -> None:
+    ensure_orders_ingest_schema(db)
     while True:
         console.clear()
         header()
@@ -500,16 +587,21 @@ def _show_order_details(db: DB, order_uid: str) -> None:
             return
         o = o[0]
 
-        archived = safe_str(o.get("archived_path"))
-        original = safe_str(o.get("original_path"))
+        archived = safe_str(row_get(o, "archived_path"))
+        original = safe_str(row_get(o, "original_path"))
 
         body = []
-        body.append(f"[bold]Vendor:[/bold] {safe_str(o.get('vendor'))}")
-        body.append(f"[bold]Order:[/bold] {safe_str(o.get('order_id') or o.get('order_ref') or '')}")
-        body.append(f"[bold]Order date:[/bold] {safe_str(o.get('order_date'))}")
-        body.append(f"[bold]Ingested:[/bold] {safe_str(o.get('first_seen_utc'))}")
-        body.append(f"[bold]Total:[/bold] {safe_str(o.get('total'))}")
-        body.append(f"[bold]File hash:[/bold] {safe_str(o.get('file_hash'))}")
+        body.append(f"[bold]Vendor:[/bold] {safe_str(row_get(o, 'vendor'))}")
+        is_voided = bool(int(row_get(o, 'is_voided') or 0))
+        if is_voided:
+            body.append("[bold red]Status:[/bold red] VOIDED")
+        else:
+            body.append("[bold green]Status:[/bold green] ACTIVE")
+        body.append(f"[bold]Order:[/bold] {safe_str(row_get(o, 'order_id') or row_get(o, 'order_ref') or '')}")
+        body.append(f"[bold]Order date:[/bold] {safe_str(row_get(o, 'order_date'))}")
+        body.append(f"[bold]Ingested:[/bold] {safe_str(row_get(o, 'first_seen_utc'))}")
+        body.append(f"[bold]Total:[/bold] {safe_str(row_get(o, 'total'))}")
+        body.append(f"[bold]File hash:[/bold] {safe_str(row_get(o, 'file_hash'))}")
         if archived:
             body.append(f"[bold]Archived PDF:[/bold] {archived}")
         if original:
@@ -538,34 +630,79 @@ def _show_order_details(db: DB, order_uid: str) -> None:
 
         for r in items:
             it.add_row(
-                safe_str(r.get("line")),
-                safe_str(r.get("sku")),
-                shorten(r.get("description"), 60),
-                safe_str(r.get("units_received") or r.get("shipped") or r.get("ordered") or ""),
-                safe_str(r.get("unit_price") or ""),
-                safe_str(r.get("line_total") or ""),
+                safe_str(row_get(r, "line")),
+                safe_str(row_get(r, "sku")),
+                shorten(row_get(r, "description"), 60),
+                safe_str(row_get(r, "units_received") or row_get(r, "shipped") or row_get(r, "ordered") or ""),
+                safe_str(row_get(r, "unit_price") or ""),
+                safe_str(row_get(r, "line_total") or ""),
             )
 
         console.print(it)
 
+        
         opts = ["b"]
         prompt = "\n[b] Back"
         if archived:
             opts.append("o")
             prompt += "   [o] Open archived PDF"
-        opts.append("d")
-        prompt += "   [d] Delete this order"
+
+        if not is_voided:
+            opts.append("v")
+            prompt += "   [v] Void this order (log removals)"
+        else:
+            opts.append("u")
+            prompt += "   [u] Undo void (remove those removals)"
+
+        opts.append("p")
+        prompt += "   [p] Purge order (delete rows + hash)"
 
         cmd = Prompt.ask(prompt, choices=opts, default="b")
 
         if cmd == "b":
             return
+
         if cmd == "o" and archived:
             _open_pdf(Path(archived))
             pause()
             continue
-        if cmd == "d":
-            ok = Confirm.ask("Delete this order AND rebuild inventory?", default=False)
+
+        if cmd == "v" and not is_voided:
+            ok = Confirm.ask("Void this order? (adds entries to parts_removed so inventory on-hand stays correct)", default=False)
+            if not ok:
+                continue
+            token = Prompt.ask("Type VOID to confirm", default="")
+            if token.strip() != "VOID":
+                console.print("[yellow]Cancelled.[/yellow]")
+                pause()
+                continue
+            try:
+                n = _void_order_to_parts_removed(db, order_uid)
+                console.print(f"[green]Order voided.[/green] Logged {n} removal row(s).")
+            except Exception as e:
+                console.print(f"[red]Void failed:[/red] {e}")
+            pause()
+            continue
+
+        if cmd == "u" and is_voided:
+            ok = Confirm.ask("Undo void? (removes parts_removed rows created by voiding this order)", default=False)
+            if not ok:
+                continue
+            token = Prompt.ask("Type UNVOID to confirm", default="")
+            if token.strip() != "UNVOID":
+                console.print("[yellow]Cancelled.[/yellow]")
+                pause()
+                continue
+            try:
+                n = _undo_void_order(db, order_uid)
+                console.print(f"[green]Void undone.[/green] Removed {n} removal row(s).")
+            except Exception as e:
+                console.print(f"[red]Unvoid failed:[/red] {e}")
+            pause()
+            continue
+
+        if cmd == "p":
+            ok = Confirm.ask("Purge this order from the DB? (deletes orders + line_items and clears the duplicate stopper hash)", default=False)
             if not ok:
                 continue
             token = Prompt.ask("Type DELETE to confirm", default="")
@@ -574,22 +711,187 @@ def _show_order_details(db: DB, order_uid: str) -> None:
                 pause()
                 continue
             try:
-                _delete_order_and_rebuild(db, order_uid)
-                console.print("[green]Order deleted. Inventory rebuilt.[/green]")
+                _purge_order_and_rebuild(db, order_uid)
+                console.print("[green]Order purged. Inventory rebuilt.[/green]")
             except Exception as e:
-                console.print(f"[red]Delete failed:[/red] {e}")
+                console.print(f"[red]Purge failed:[/red] {e}")
             pause()
             return
 
 
-def _delete_order_and_rebuild(db: DB, order_uid: str) -> None:
-    import sqlite3
-    from datetime import datetime, timezone
 
+
+def _void_order_to_parts_removed(db: DB, order_uid: str) -> int:
+    """Marks an order as voided and logs offsetting removals into parts_removed.
+
+    This preserves history (orders/line_items remain) while keeping inventory_view on_hand consistent.
+    """
+    ensure_orders_ingest_schema(db)
+    ts = utc_now_iso()
+    ensure_inventory_events_table(db)
+
+    with db.connect() as con:
+        con.execute("PRAGMA foreign_keys = ON;")
+
+        o = con.execute(
+            "SELECT order_uid, vendor, order_id, order_ref, order_date, file_hash, COALESCE(is_voided,0) AS is_voided FROM orders WHERE order_uid = ?",
+            [order_uid],
+        ).fetchone()
+        if o is None:
+            raise ValueError("Order not found.")
+        if int(o["is_voided"] or 0) == 1:
+            return 0
+
+        # Aggregate received units per part_key from this order
+        rows = con.execute(
+            """
+            SELECT part_key, SUM(COALESCE(units_received, 0)) AS qty
+            FROM line_items
+            WHERE order_uid = ?
+            GROUP BY part_key
+            HAVING SUM(COALESCE(units_received, 0)) > 0
+            """,
+            [order_uid],
+        ).fetchall()
+
+        vendor = safe_str(o["vendor"])
+        order_label = safe_str(o["order_id"] or o["order_ref"] or "")
+        file_hash = safe_str(o["file_hash"])
+        reason = f"void_order vendor={vendor} order={order_label} uid={order_uid} hash={file_hash}".strip()
+
+        n = 0
+        for r in rows:
+            part_key = safe_str(r["part_key"])
+            qty = float(r["qty"] or 0)
+            if not part_key or qty <= 0:
+                continue
+
+            removal_uid = str(uuid4())
+            con.execute(
+                """
+                INSERT INTO parts_removed (removal_uid, part_key, qty_removed, ts_utc, project, note, updated_utc, order_uid, file_hash, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [removal_uid, part_key, qty, ts, "order_void", reason, ts, order_uid, file_hash, "order_void"],
+            )
+
+            # Unified event log (qty negative for remove)
+            con.execute(
+                """
+                INSERT INTO inventory_events (event_uid, ts_utc, event_type, part_key, qty, unit_cost, total_cost, project, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [str(uuid4()), ts, "order_void", part_key, -qty, None, None, "order_void", reason],
+            )
+            n += 1
+
+        # Mark the order voided
+        con.execute(
+            """
+            UPDATE orders
+            SET is_voided = 1, voided_utc = ?, updated_utc = COALESCE(updated_utc, ?)
+            WHERE order_uid = ?
+            """,
+            [ts, ts, order_uid],
+        )
+        # Optional: mark ingested_files too (does NOT affect duplicate stopper unless ingest code checks it)
+        if file_hash:
+            try:
+                con.execute("UPDATE ingested_files SET is_voided = 1 WHERE file_hash = ?", [file_hash])
+            except Exception:
+                pass
+
+        con.commit()
+
+    return n
+
+
+def _undo_void_order(db: DB, order_uid: str) -> int:
+    """Undo a prior void: deletes the parts_removed rows created by _void_order_to_parts_removed."""
+    ensure_orders_ingest_schema(db)
+    ts = utc_now_iso()
+    ensure_inventory_events_table(db)
+
+    with db.connect() as con:
+        con.execute("PRAGMA foreign_keys = ON;")
+
+        o = con.execute(
+            "SELECT order_uid, file_hash, COALESCE(is_voided,0) AS is_voided FROM orders WHERE order_uid = ?",
+            [order_uid],
+        ).fetchone()
+        if o is None:
+            raise ValueError("Order not found.")
+        if int(o["is_voided"] or 0) == 0:
+            return 0
+
+        file_hash = safe_str(o["file_hash"])
+
+        # Remove the removals we created (tagged by order_uid + reason)
+        cur = con.execute(
+            """
+            DELETE FROM parts_removed
+            WHERE order_uid = ?
+              AND (reason = 'order_void' OR project = 'order_void')
+            """,
+            [order_uid],
+        )
+        removed = int(cur.rowcount or 0)
+
+        # Also remove matching inventory_events (best-effort)
+        try:
+            con.execute(
+                """
+                DELETE FROM inventory_events
+                WHERE event_type = 'order_void'
+                  AND note LIKE ?
+                """,
+                [f"%uid={order_uid}%"],
+            )
+        except Exception:
+            pass
+
+        # Unmark order
+        con.execute(
+            """
+            UPDATE orders
+            SET is_voided = 0, voided_utc = NULL, updated_utc = COALESCE(updated_utc, ?)
+            WHERE order_uid = ?
+            """,
+            [ts, order_uid],
+        )
+        if file_hash:
+            try:
+                con.execute("UPDATE ingested_files SET is_voided = 0 WHERE file_hash = ?", [file_hash])
+            except Exception:
+                pass
+
+        con.commit()
+
+    return removed
+
+
+def _purge_order_and_rebuild(db: DB, order_uid: str) -> None:
+    """Hard-delete the order + line items and clear its hash, then rebuild parts_received/inventory.
+
+    This is the "I want to ingest again" path.
+    """
     with db.connect() as con:
         con.execute("PRAGMA foreign_keys = ON;")
         row = con.execute("SELECT file_hash FROM orders WHERE order_uid = ?", [order_uid]).fetchone()
         file_hash = None if row is None else row[0]
+
+        # If this order was voided, remove the void removals too (so inventory doesn't stay offset).
+        try:
+            con.execute(
+                """
+                DELETE FROM parts_removed
+                WHERE order_uid = ?
+                  AND (reason = 'order_void' OR project = 'order_void')
+                """,
+                [order_uid],
+            )
+        except Exception:
+            pass
 
         con.execute("DELETE FROM line_items WHERE order_uid = ?", [order_uid])
         con.execute("DELETE FROM orders WHERE order_uid = ?", [order_uid])
@@ -602,6 +904,12 @@ def _delete_order_and_rebuild(db: DB, order_uid: str) -> None:
 
         _rebuild_parts_received_and_inventory(con)
         con.commit()
+
+
+def _delete_order_and_rebuild(db: DB, order_uid: str) -> None:
+    # Backwards-compat wrapper
+    _purge_order_and_rebuild(db, order_uid)
+
 
 
 def _rebuild_parts_received_and_inventory(con) -> None:
@@ -1367,23 +1675,37 @@ def inv_edit_labels(db: DB):
 def menu_db_diagnostics():
     db_path = default_db_path()
 
-    if not db_path.exists():
+    def _show_header() -> None:
         console.clear()
         header()
         console.print("[bold]DB diagnostics[/bold]\n")
         console.print(f"DB path: [cyan]{db_path}[/cyan]")
         console.print(f"DB exists: {'✅' if db_path.exists() else '❌'}\n")
-        pause()
+
+    # If the DB doesn't exist yet, offer to create it.
+    if not db_path.exists():
+        _show_header()
+        menu = Table(show_header=False, box=None)
+        menu.add_row("1.", "Create empty database (init schema)")
+        menu.add_row("0.", "Back")
+        console.print(menu)
+
+        choice = Prompt.ask("\nChoose", choices=["1", "0"], default="0")
+        if choice == "1":
+            ok = Confirm.ask("Create a new empty database now?", default=True)
+            if ok:
+                from studio_inventory.main import init_inventory_db
+                init_inventory_db(db_path)
+                db = get_db()
+                ensure_inventory_events_table(db)
+                console.print("[green]Database created.[/green]")
+                pause()
         return
 
     db = get_db()
 
     while True:
-        console.clear()
-        header()
-        console.print("[bold]DB diagnostics[/bold]\n")
-        console.print(f"DB path: [cyan]{db_path}[/cyan]")
-        console.print(f"DB exists: {'✅' if db_path.exists() else '❌'}\n")
+        _show_header()
 
         tables = db.rows("""
             SELECT name, type
@@ -1411,18 +1733,19 @@ def menu_db_diagnostics():
 
         console.print(t)
 
-        menu = Table(show_header=False, box=None)
-        menu.add_row("1.", "Reset database (clear all data)")
-        menu.add_row("0.", "Back")
         console.print("\n")
+        menu = Table(show_header=False, box=None)
+        menu.add_row("1.", "Reset database contents (truncate tables; keep schema)")
+        menu.add_row("2.", "Hard reset database file (delete DB; recreate schema)")
+        menu.add_row("0.", "Back")
         console.print(menu)
 
-        choice = Prompt.ask("\nChoose", choices=["1", "0"], default="0")
+        choice = Prompt.ask("\nChoose", choices=["1", "2", "0"], default="0")
         if choice == "0":
             return
 
         if choice == "1":
-            console.print("\n[red][bold]DANGER[/bold][/red] This will permanently delete ALL data in your DB.")
+            console.print("\n[red][bold]DANGER[/bold][/red] This will permanently delete ALL data in your DB (schema stays).")
             ok = Confirm.ask("Continue?", default=False)
             if not ok:
                 console.print("[yellow]Cancelled.[/yellow]")
@@ -1436,35 +1759,101 @@ def menu_db_diagnostics():
 
             try:
                 _reset_database_contents(db)
+                ensure_inventory_events_table(db)
                 console.print("[green]Database cleared.[/green]")
             except Exception as e:
                 console.print(f"[red]Reset failed:[/red] {e}")
             pause()
+            continue
+
+        if choice == "2":
+            console.print("\n[red][bold]DANGER[/bold][/red] This will DELETE the SQLite file on disk and recreate an empty schema.")
+            ok = Confirm.ask("Continue?", default=False)
+            if not ok:
+                console.print("[yellow]Cancelled.[/yellow]")
+                pause()
+                continue
+            token = Prompt.ask("Type RESET to confirm", default="")
+            if token.strip() != "RESET":
+                console.print("[yellow]Cancelled.[/yellow]")
+                pause()
+                continue
+
+            try:
+                # Close any open connections by dropping the DB wrapper and deleting files.
+                db = None  # type: ignore
+
+                # Remove main DB and sidecar WAL/SHM files (best effort).
+                for p in [db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")]:
+                    try:
+                        if p.exists():
+                            p.unlink()
+                    except Exception:
+                        pass
+
+                from studio_inventory.main import init_inventory_db
+                init_inventory_db(db_path)
+
+                db = get_db()
+                ensure_inventory_events_table(db)
+
+                console.print("[green]Database recreated.[/green]")
+            except Exception as e:
+                console.print(f"[red]Hard reset failed:[/red] {e}")
+            pause()
+
 
 
 def _reset_database_contents(db: DB) -> None:
-    """Delete all rows from all user tables (keeps schema)."""
+    """Delete all rows from all user tables (keeps schema).
+
+    Notes:
+      - This does NOT drop tables; it truncates them.
+      - Also clears AUTOINCREMENT counters (sqlite_sequence) when present.
+    """
+    # First pass: delete rows with FK checks disabled (best effort), then restore FK checks.
     with db.connect() as con:
-        con.execute("PRAGMA foreign_keys = OFF;")
-        tables = con.execute(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type='table'
-              AND name NOT LIKE 'sqlite_%'
-            """
-        ).fetchall()
+        try:
+            con.execute("PRAGMA foreign_keys = OFF;")
 
-        # deterministic order helps with debugging
-        names = sorted([r[0] for r in tables])
-        for name in names:
-            con.execute(f'DELETE FROM "{name}";')
+            tables = con.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type='table'
+                  AND name NOT LIKE 'sqlite_%'
+                """
+            ).fetchall()
 
-        con.execute("PRAGMA foreign_keys = ON;")
-        con.commit()
+            # deterministic order helps with debugging
+            names = sorted([r[0] for r in tables])
+            for name in names:
+                con.execute(f'DELETE FROM "{name}";')
+
+            # Reset AUTOINCREMENT sequences if the internal table exists
+            try:
+                con.execute("DELETE FROM sqlite_sequence;")
+            except Exception:
+                pass
+
+            con.commit()
+        finally:
+            # Always attempt to re-enable FK checks for this connection
+            try:
+                con.execute("PRAGMA foreign_keys = ON;")
+            except Exception:
+                pass
+
+    # Optional: compact the DB file after large deletes (best effort)
+    try:
+        with db.connect() as con2:
+            con2.execute("VACUUM;")
+    except Exception:
+        pass
 
 # ----------------------------
 # Future stubs
+
 # ----------------------------
 def menu_vendors():
     console.clear()
@@ -1797,7 +2186,7 @@ def _layout_summary(layout: dict) -> None:
             str(e.get("pos","UL")),
             str(e.get("span", 1)),
             str(e.get("align","left")),
-            "yes" if e.get("wrap") else "no",
+            "yes" if row_get(e, "wrap") else "no",
             str(e.get("max_lines", 1)),
         )
     console.print(t)
