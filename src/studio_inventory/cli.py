@@ -9,6 +9,8 @@ import os
 import subprocess
 import sys
 
+from importlib import resources
+import shutil
 
 # ----------------------------
 # Workspace (runtime data) paths
@@ -187,6 +189,27 @@ def timestamp_slug() -> str:
     # local time is fine for filenames
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
+def seed_label_templates() -> int:
+    """
+    Copy packaged default templates into workspace label_templates/.
+    Does not overwrite existing user files.
+    """
+    dst = label_templates_dir()
+    copied = 0
+
+    pkg_dir = resources.files("studio_inventory") / "label_templates"
+    if not pkg_dir.is_dir():
+        return 0
+
+    for src in pkg_dir.iterdir():
+        if src.is_file() and src.name.endswith(".json"):
+            out = dst / src.name
+            if not out.exists():
+                with resources.as_file(src) as src_path:
+                    shutil.copy2(src_path, out)
+                copied += 1
+
+    return copied
 
 # ----------------------------
 # Ingest runner (subprocess)
@@ -2439,7 +2462,10 @@ def init():
     """
     ensure_workspace()
     console.print(f"📁 Location: {workspace_root()}")
-    root = workspace_root()
+
+    copied = seed_label_templates()
+    if copied:
+        console.print(f"[dim]Seeded {copied} default label template(s).[/dim]")
 
     # Seed packaged templates into the user workspace on first run (pipx/wheel safe)
     dst = label_templates_dir()
